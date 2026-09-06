@@ -1,0 +1,125 @@
+// Managed by rmaher001/ha-addons (alloy/config.alloy). Home Assistant OS ships
+// its journal to the estate's log store; the rule engine there decides what
+// in it is an incident. Nothing in Home Assistant reads its own log.
+//
+// The shape mirrors the estate's other journal shippers (homelab-infra
+// proxmox1/lxc/224-incidents/files/etc/alloy/config.alloy): the same labels,
+// the same timestamp rule, the same transient-unit drop.
+
+loki.relabel "journal" {
+  forward_to = []
+
+  // systemd unit -> `unit`. NOTE the DOUBLE underscore: the journal field is
+  // _SYSTEMD_UNIT, and Alloy prefixes __journal to the lowercased name.
+  rule {
+    source_labels = ["__journal__systemd_unit"]
+    target_label  = "unit"
+  }
+
+  // journald fills _SYSTEMD_UNIT by a cgroup lookup that a short-lived
+  // process can beat; SYSLOG_IDENTIFIER travels in the datagram itself.
+  // Matches only when the first source is empty.
+  rule {
+    source_labels = ["__journal__systemd_unit", "__journal_syslog_identifier"]
+    separator     = ";"
+    regex         = ";(.+)"
+    target_label  = "unit"
+    replacement   = "$1"
+  }
+
+  // A container's lines arrive through docker's journald driver under
+  // docker.service; the thing that logged is the container. So `unit` is the
+  // container name where there is one - homeassistant (Core),
+  // hassio_supervisor, app_<hash>_<slug> for an add-on - and `container`
+  // carries it too.
+  rule {
+    source_labels = ["__journal_container_name"]
+    regex         = "(.+)"
+    target_label  = "unit"
+    replacement   = "$1"
+  }
+  rule {
+    source_labels = ["__journal_container_name"]
+    target_label  = "container"
+  }
+
+  // PRIORITY means two things. For the host's own units it is severity. For a
+  // container line it only says which stream docker read it from - stdout is
+  // stamped info (6), stderr err (3) - whatever the line says; Core logs to
+  // stderr, so calling that "error" would make every Core line an error. So:
+  // `severity` only for lines with no container, `stream` for the rest. A
+  // container's real level is in its text ("ERROR (MainThread) [...]"), and
+  // the rules match on that.
+  rule {
+    source_labels = ["__journal_container_name", "__journal_priority_keyword"]
+    separator     = "@"
+    regex         = "@(.*)"
+    target_label  = "severity"
+    replacement   = "$1"
+  }
+  rule {
+    source_labels = ["__journal_container_name", "__journal_priority_keyword"]
+    separator     = "@"
+    regex         = ".+@info"
+    target_label  = "stream"
+    replacement   = "stdout"
+  }
+  rule {
+    source_labels = ["__journal_container_name", "__journal_priority_keyword"]
+    separator     = "@"
+    regex         = ".+@(err|error)"
+    target_label  = "stream"
+    replacement   = "stderr"
+  }
+
+  // Transient units are minted per login and per run and are unbounded;
+  // without this `unit` slowly becomes a high-cardinality label.
+  rule {
+    source_labels = ["__journal__systemd_unit"]
+    regex         = "(session-[a-z]*[0-9]+\\.scope|user@[0-9]+\\.service|run-[a-zA-Z0-9]+\\.(scope|service))"
+    action        = "drop"
+  }
+}
+
+loki.source.journal "host" {
+  // Empty path => Alloy reads both /var/log/journal and /run/log/journal,
+  // wherever the Supervisor mounted the host's journal.
+  max_age       = "12h"
+  relabel_rules = loki.relabel.journal.rules
+  forward_to    = [loki.process.normalize.receiver]
+
+  labels = {
+    job        = "journal",
+    host       = "homeassistant",
+    vmid       = "200",
+    node       = "proxmox2",
+    guest_type = "vm",
+  }
+}
+
+// The entry timestamp is EVENT time (journald supplies it); ingestion time
+// rides along as structured metadata, never as a label.
+loki.process "normalize" {
+  forward_to = [loki.write.victorialogs.receiver]
+
+  stage.template {
+    source   = "received_at"
+    template = "{{ now | unixEpoch }}"
+  }
+  stage.structured_metadata {
+    values = { received_at = "received_at" }
+  }
+}
+
+// The estate's log store. The WAL keeps entries on disk across a store
+// restart or a network blip.
+loki.write "victorialogs" {
+  endpoint {
+    url = "http://192.168.20.222:9428/insert/loki/api/v1/push"
+  }
+  wal {
+    enabled         = true
+    max_segment_age = "12h"
+    drain_timeout   = "60s"
+  }
+}

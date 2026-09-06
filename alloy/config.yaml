@@ -1,0 +1,22 @@
+name: Alloy (homelab)
+version: "1.0.0"
+slug: alloy
+description: >-
+  Ships Home Assistant OS's journal - Core, Supervisor, every add-on and the
+  host itself - to the homelab's log store. Nothing here decides anything.
+url: https://github.com/rmaher001/ha-addons
+arch:
+  - amd64
+# The image is Grafana's own; it has no init of its own, so the Supervisor
+# supplies one.
+init: true
+startup: services
+boot: auto
+# The host journal, read-only. This is the whole point of the add-on.
+journald: true
+# Alloy's debug UI stays inside the add-on's network: the watchdog reaches
+# it, nothing on the LAN does.
+ports:
+  12345/tcp: null
+watchdog: http://[HOST]:[PORT:12345]/-/ready
+stage: stable
