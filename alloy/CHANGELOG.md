@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.2
+
+- `job=journal` is set after the source: Alloy stamps its component id on
+  journal lines over the source's labels block.
+- Terminal colour codes are stripped from Core's lines.
+- An icon.
+
 ## 1.0.1
 
 - The journal path is chosen at start (`run.sh`) and passed to Alloy

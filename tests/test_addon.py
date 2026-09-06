@@ -2,6 +2,7 @@
 options. These tests pin the shape so a change to it is deliberate."""
 import pathlib
 import re
+import struct
 
 import yaml
 
@@ -107,3 +108,24 @@ def test_the_docs_query_the_severity_values_alloy_really_writes():
     docs = read("DOCS.md")
     assert "severity:(error OR crit)" in docs and "severity:(err " not in docs
     assert '(err|error)' not in read("config.alloy")
+
+
+def test_the_job_label_is_set_by_us_not_by_alloys_component_id():
+    """Alloy 1.19 stamps job=<component id> on journal lines, overriding the
+    source's labels block (seen live: job="loki.source.journal.host"). A
+    static_labels stage after the source is what makes job=journal stick."""
+    c = read("config.alloy")
+    assert "stage.static_labels" in c and 'job = "journal"' in c
+
+
+def test_terminal_colour_codes_are_stripped_from_the_text():
+    # Core logs to stderr with ANSI colours; the incident text must not carry them
+    c = read("config.alloy")
+    assert "stage.replace" in c and '\\x1b\\[[0-9;]*m' in c
+
+
+def test_the_addon_has_an_icon():
+    icon = (ADDON / "icon.png").read_bytes()
+    assert icon[:8] == b"\x89PNG\r\n\x1a\n"
+    width, height = struct.unpack(">II", icon[16:24])
+    assert (width, height) == (128, 128)
