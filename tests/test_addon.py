@@ -122,7 +122,8 @@ def test_terminal_colour_codes_are_stripped_from_the_text():
     # Core logs to stderr with ANSI colours; the incident text must not carry them
     c = read("config.alloy")
     # River escaping: the file spells the regex \\x1b\\[ so Alloy's regex engine sees \x1b\[
-    assert "stage.replace" in c and 'expression = "\\\\x1b\\\\[[0-9;]*m"' in c
+    # stage.replace replaces CAPTURE GROUPS only (1.0.2 had no group and stripped nothing)
+    assert "stage.replace" in c and 'expression = "(\\\\x1b\\\\[[0-9;]*m)"' in c
 
 
 def test_the_addon_has_an_icon():

@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.3
+
+- The colour-code strip works: `stage.replace` replaces what its capture
+  group matches, and 1.0.2's expression had no group.
+
 ## 1.0.2
 
 - `job=journal` is set after the source: Alloy stamps its component id on
