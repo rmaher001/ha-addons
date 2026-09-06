@@ -45,7 +45,7 @@ loki.relabel "journal" {
 
   // PRIORITY means two things. For the host's own units it is severity. For a
   // container line it only says which stream docker read it from - stdout is
-  // stamped info (6), stderr err (3) - whatever the line says; Core logs to
+  // stamped info (6), stderr error (3) - whatever the line says; Core logs to
   // stderr, so calling that "error" would make every Core line an error. So:
   // `severity` only for lines with no container, `stream` for the rest. A
   // container's real level is in its text ("ERROR (MainThread) [...]"), and
@@ -67,7 +67,7 @@ loki.relabel "journal" {
   rule {
     source_labels = ["__journal_container_name", "__journal_priority_keyword"]
     separator     = "@"
-    regex         = ".+@(err|error)"
+    regex         = ".+@error"
     target_label  = "stream"
     replacement   = "stderr"
   }

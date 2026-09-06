@@ -32,7 +32,7 @@ Queries:
 ```
 host:homeassistant unit:homeassistant "Error while executing automation"
 host:homeassistant unit:hassio_supervisor
-host:homeassistant severity:(err OR crit)          # the host's own units
+host:homeassistant severity:(error OR crit)        # the host's own units
 ```
 
 ## No options

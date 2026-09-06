@@ -75,3 +75,20 @@ def test_container_lines_carry_stream_and_host_units_carry_severity():
 def test_transient_units_are_dropped_before_they_become_a_label():
     c = read("config.alloy")
     assert "session-[a-z]*[0-9]+\\\\.scope" in c and 'action        = "drop"' in c
+
+
+def test_an_experimental_feature_in_the_config_has_its_flag_on_the_command_line():
+    """loki.write's wal block is EXPERIMENTAL in Alloy 1.19: without
+    --stability.level=experimental Alloy refuses the config and the add-on
+    crash-loops, shipping nothing (review, 2026-09-05)."""
+    c = read("config.alloy")
+    cmd = re.search(r'^CMD \[(.*)\]', read("Dockerfile"), re.M).group(1)
+    if "wal {" in c:
+        assert '"--stability.level=experimental"' in cmd
+
+
+def test_the_docs_query_the_severity_values_alloy_really_writes():
+    # journald priority 3 is spelled "error" by Alloy, never "err"
+    docs = read("DOCS.md")
+    assert "severity:(error OR crit)" in docs and "severity:(err " not in docs
+    assert '(err|error)' not in read("config.alloy")
