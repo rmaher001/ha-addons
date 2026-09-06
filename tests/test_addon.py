@@ -121,7 +121,8 @@ def test_the_job_label_is_set_by_us_not_by_alloys_component_id():
 def test_terminal_colour_codes_are_stripped_from_the_text():
     # Core logs to stderr with ANSI colours; the incident text must not carry them
     c = read("config.alloy")
-    assert "stage.replace" in c and '\\x1b\\[[0-9;]*m' in c
+    # River escaping: the file spells the regex \\x1b\\[ so Alloy's regex engine sees \x1b\[
+    assert "stage.replace" in c and 'expression = "\\\\x1b\\\\[[0-9;]*m"' in c
 
 
 def test_the_addon_has_an_icon():
