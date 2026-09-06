@@ -1,5 +1,5 @@
 name: Alloy (homelab)
-version: "1.0.0"
+version: "1.0.1"
 slug: alloy
 description: >-
   Ships Home Assistant OS's journal - Core, Supervisor, every add-on and the

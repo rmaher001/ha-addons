@@ -37,14 +37,31 @@ def test_the_debug_port_is_not_exposed_but_the_watchdog_still_reaches_it():
     assert cfg["watchdog"] == "http://[HOST]:[PORT:12345]/-/ready"
 
 
-def test_the_image_is_pinned_to_one_alloy_release():
+def alloy_command():
+    """The one line that starts Alloy: run.sh's exec."""
+    return re.search(r"^exec /bin/alloy run (.*)$", read("run.sh"), re.M).group(1)
+
+
+def test_the_image_is_pinned_to_one_alloy_release_and_started_by_our_script():
     df = read("Dockerfile")
     froms = re.findall(r"^FROM (\S+)", df, re.M)
     assert len(froms) == 1 and re.fullmatch(r"grafana/alloy:v\d+\.\d+\.\d+", froms[0]), froms
     assert "COPY config.alloy /etc/alloy/config.alloy" in df
-    cmd = re.search(r'^CMD \[(.*)\]', df, re.M).group(1)
-    for arg in ("run", "--disable-reporting", "--storage.path=/data/alloy", "/etc/alloy/config.alloy"):
-        assert f'"{arg}"' in cmd, arg
+    assert 'ENTRYPOINT ["/run.sh"]' in df and "CMD" not in df
+    cmd = alloy_command()
+    for arg in ("--disable-reporting", "--storage.path=/data/alloy", "/etc/alloy/config.alloy"):
+        assert arg in cmd, arg
+
+
+def test_the_journal_path_is_chosen_at_start_never_left_empty():
+    """An empty `path` opens the journal 'local only' - the container's own
+    machine-id - and reads nothing (found live 2026-09-05: zero lines).
+    run.sh picks whichever of the two host directories holds the journal."""
+    sh = read("run.sh")
+    assert sh.startswith("#!/bin/sh"), "the Alloy image has sh, nothing more"
+    assert "/var/log/journal" in sh and "/run/log/journal" in sh
+    assert "export JOURNAL_PATH" in sh
+    assert 'path          = sys.env("JOURNAL_PATH")' in read("config.alloy")
 
 
 def test_the_version_is_the_changelogs_newest_entry():
@@ -81,10 +98,8 @@ def test_an_experimental_feature_in_the_config_has_its_flag_on_the_command_line(
     """loki.write's wal block is EXPERIMENTAL in Alloy 1.19: without
     --stability.level=experimental Alloy refuses the config and the add-on
     crash-loops, shipping nothing (review, 2026-09-05)."""
-    c = read("config.alloy")
-    cmd = re.search(r'^CMD \[(.*)\]', read("Dockerfile"), re.M).group(1)
-    if "wal {" in c:
-        assert '"--stability.level=experimental"' in cmd
+    if "wal {" in read("config.alloy"):
+        assert "--stability.level=experimental" in alloy_command()
 
 
 def test_the_docs_query_the_severity_values_alloy_really_writes():

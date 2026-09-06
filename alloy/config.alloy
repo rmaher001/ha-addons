@@ -82,8 +82,10 @@ loki.relabel "journal" {
 }
 
 loki.source.journal "host" {
-  // Empty path => Alloy reads both /var/log/journal and /run/log/journal,
-  // wherever the Supervisor mounted the host's journal.
+  // Set by run.sh to whichever of /var/log/journal and /run/log/journal
+  // holds the host's journal. Never empty: an empty path opens the journal
+  // "local only" - the container's own machine-id - and reads nothing.
+  path          = sys.env("JOURNAL_PATH")
   max_age       = "12h"
   relabel_rules = loki.relabel.journal.rules
   forward_to    = [loki.process.normalize.receiver]
