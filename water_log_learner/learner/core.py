@@ -10,7 +10,7 @@ model reproduces the rules, and his corrections both override them and teach
 kinds the rules never had (washer, dishwasher, his own names).
 """
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -108,6 +108,8 @@ def latest(lines, at_key):
             at = datetime.fromisoformat(line[at_key].replace("Z", "+00:00"))
         except ValueError:
             continue
+        if at.tzinfo is None:                  # a time with no offset is UTC, never naive-vs-aware
+            at = at.replace(tzinfo=timezone.utc)
         cur = best.get(line["start"])
         if cur is None or at >= cur[0]:
             best[line["start"]] = (at, label)

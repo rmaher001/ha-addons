@@ -279,3 +279,48 @@ def test_append_repair_and_status_mode(tmp_path, monkeypatch):
     assert json.loads(f.read_text().splitlines()[-1])["start"] == "B"
     learner_main.write_status({"labels": 0})
     assert oct((tmp_path / "model_status.json").stat().st_mode & 0o777) == "0o644"
+
+
+@pytest.mark.requirement("water_log_learner: a failing FIRST training backs off instead of retrying every pass")
+def test_failing_first_training_backs_off(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    _write_month(tmp_path, history())
+    lrn = learner_main.Learner()
+    calls = []
+
+    def boom(recs):
+        calls.append(1)
+        raise RuntimeError("fit failed")
+    monkeypatch.setattr(lrn, "retrain", boom)
+    for k in range(5):
+        try:
+            lrn.tick(now=1793000000 + 30 * k)
+        except RuntimeError:
+            pass
+    assert calls == [1]
+    try:
+        lrn.tick(now=1793000000 + learner_main.FIRST_RETRY_S + 1)
+    except RuntimeError:
+        pass
+    assert calls == [1, 1]
+
+
+@pytest.mark.requirement("water_log_learner: a time without an offset is UTC and never breaks the comparison")
+def test_latest_naive_and_aware():
+    lines = [{"start": "A", "label": "flush", "at": "2026-11-18T06:00:00"},
+             {"start": "A", "label": "faucet", "at": "2026-11-18T06:00:01+00:00"},
+             {"start": "B", "label": "washer", "at": "2026-11-18T07:00:00+00:00"},
+             {"start": "B", "label": "bath", "at": "2026-11-18T06:00:00"}]
+    assert core.latest(lines, "at") == {"A": "faucet", "B": "washer"}
+
+
+@pytest.mark.requirement("water_log_learner: a stop request mid-write waits for the line to finish, then exits")
+def test_stop_during_write_finishes_the_line(tmp_path, monkeypatch):
+    f = tmp_path / "model_labels.jsonl"
+    learner_main.STOP["now"] = True
+    try:
+        with pytest.raises(SystemExit):
+            learner_main.append_lines(str(f), [{"start": "B", "label": "flush", "model_at": "2026-11-18T06:00:00+00:00"}])
+        assert json.loads(f.read_text().splitlines()[-1])["start"] == "B"
+    finally:
+        learner_main.STOP["now"] = False

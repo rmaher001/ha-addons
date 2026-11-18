@@ -12,6 +12,7 @@ import glob
 import json
 import os
 import signal
+import sys
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -19,10 +20,14 @@ from zoneinfo import ZoneInfo
 
 from learner import core
 
+STOP = {"now": False}
+
 LOG_DIR = os.environ.get("WATER_LOG_DIR", "/homeassistant/water_log")
 TZ = os.environ.get("WATER_LOG_TZ", "America/Los_Angeles")
 POLL_S = 30
 DEBOUNCE_S = 60
+FIRST_RETRY_S = 600          # a failed FIRST training is retried after 10 min, not every pass
+WRITING = {"now": False}     # a stop request waits only while a file is being written
 NIGHTLY = (3, 30)
 
 
@@ -59,6 +64,16 @@ def records():
 def append_lines(path, lines):
     if not lines:
         return
+    WRITING["now"] = True
+    try:
+        _append_lines(path, lines)
+    finally:
+        WRITING["now"] = False
+    if STOP["now"]:
+        sys.exit(0)
+
+
+def _append_lines(path, lines):
     if os.path.exists(path) and os.path.getsize(path):
         with open(path, "rb") as fh:
             fh.seek(-1, os.SEEK_END)
@@ -72,6 +87,16 @@ def append_lines(path, lines):
 
 
 def write_status(status):
+    WRITING["now"] = True
+    try:
+        _write_status(status)
+    finally:
+        WRITING["now"] = False
+    if STOP["now"]:
+        sys.exit(0)
+
+
+def _write_status(status):
     fd, tmp = tempfile.mkstemp(dir=LOG_DIR, prefix=".model_status.", suffix=".tmp")
     with os.fdopen(fd, "w") as fh:
         json.dump(status, fh, sort_keys=True)
@@ -92,6 +117,7 @@ class Learner:
         self.labels_seen = None
         self.last_night = None
         self.done = set()
+        self.retry_after = 0.0
 
     def guessed(self):
         return core.latest(read_jsonl(os.path.join(LOG_DIR, "model_labels.jsonl")), "model_at")
@@ -139,22 +165,27 @@ class Learner:
         recs = records()
         if not recs:
             return
-        if self.model is None or changed or night:
+        first = self.model is None and now >= self.retry_after
+        if first or changed or night:
             # Count the attempt BEFORE running it: a retrain that fails must not
             # be retried at full cost every 30 s (the next label or night retries).
             self.labels_seen = labels_m
             if night:
                 self.last_night = local.date()
+            if self.model is None:
+                self.retry_after = now + FIRST_RETRY_S
             self.retrain(recs)
         else:
             self.label_new(recs)
 
 
-STOP = {"now": False}
-
-
 def _stop(_signum, _frame):
-    STOP["now"] = True                      # finish the current pass, then exit
+    # Exit at once - a retrain can take a while and holds nothing on disk -
+    # unless a file is being written: then append_lines/write_status exit
+    # right after the write completes, so no line is ever cut.
+    STOP["now"] = True
+    if not WRITING["now"]:
+        sys.exit(0)
 
 
 def main():
