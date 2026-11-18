@@ -1,0 +1,22 @@
+name: Water log learner
+version: "0.1.0"
+slug: water_log_learner
+description: >-
+  Learns Richard's water-use labels and labels the house's water log
+  (rmaher001/ha-automations#712). Reads /config/water_log; writes only
+  model_labels.jsonl and model_status.json there.
+url: https://github.com/rmaher001/ha-addons
+arch:
+  - amd64
+# A bare Python image has no init of its own; the Supervisor supplies one
+# (as for Alloy), so SIGTERM reaches the App and it stops between passes.
+init: true
+startup: application
+boot: auto
+# Home Assistant's /config, mounted at /homeassistant: the water log lives in
+# /config/water_log. Read-write only because the App writes its two files
+# there (model_labels.jsonl, model_status.json); it never writes anything else.
+map:
+  - type: homeassistant_config
+    read_only: false
+stage: experimental
