@@ -56,7 +56,12 @@ def _fit(X, y, w):
     # early_stopping off: above 10k rows "auto" turns it on and holds out a
     # stratified validation split, which raises on any kind with ONE example
     # (Richard's first "washer") and would hide some of his labels from training.
-    model = HistGradientBoostingClassifier(max_iter=200, learning_rate=0.1, min_samples_leaf=3,
+    # l2_regularization and max_leaf_nodes keep it stable. With early stopping off
+    # (it crashes on a one-example kind) and no regularisation, 200 rounds
+    # diverged on the real history: confident p=1.0 guesses agreeing with the
+    # rules on only 84% of uses (2026-11-17). These settings agree on 100%.
+    model = HistGradientBoostingClassifier(max_iter=100, learning_rate=0.1, min_samples_leaf=3,
+                                           l2_regularization=1.0, max_leaf_nodes=15,
                                            early_stopping=False, random_state=0)
     model.fit(X, y, sample_weight=w)
     return model
@@ -75,6 +80,24 @@ def predict(model, uses, tz):
     proba = model.predict_proba(X)
     best = proba.argmax(axis=1)
     return [(str(model.classes_[i]), float(proba[k, i])) for k, i in enumerate(best)]
+
+
+SANITY_MIN = 0.95
+
+
+def sanity(records, human, preds_rows, preds):
+    """Agreement with the rule label on uses Richard has NOT labelled, the rules
+    did NOT call unknown, and where the model did NOT pick a kind he taught.
+
+    Spreading his corrections to look-alikes (200 rule "faucet" relabelled
+    "washer" moves their twins too) and resolving the rules' unknowns is the
+    point of labelling, so neither counts. What is left is divergence on kinds
+    he never touched - the 0.1.0 failure: it scored 0.888 here on the real
+    history (2026-11-17); a healthy model scores 1.0."""
+    taught = set([v for v in human.values() if v])
+    pairs = [(u["label"], lab) for u, (lab, _p) in zip(preds_rows, preds)
+             if u["start"] not in human and u["label"] != "unknown" and lab not in taught]
+    return sum(1 for a, b in pairs if a == b) / len(pairs) if pairs else 1.0
 
 
 def apply_threshold(preds):

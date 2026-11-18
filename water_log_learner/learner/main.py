@@ -118,6 +118,7 @@ class Learner:
         self.last_night = None
         self.done = set()
         self.retry_after = 0.0
+        self.last_status = None
 
     def guessed(self):
         return core.latest(read_jsonl(os.path.join(LOG_DIR, "model_labels.jsonl")), "model_at")
@@ -130,13 +131,24 @@ class Learner:
         except Exception as err:               # the score is a report, never a blocker
             print(f"{now_iso()} self-check failed: {err!r}", flush=True)
             acc = None
-        self.model = model
+        previous_model, self.model = self.model, model
         rows = core.trainable(recs)
         at = now_iso()
-        lines = core.changed_lines([u["start"] for u in rows], core.predict(self.model, rows, TZ),
-                                   self.guessed(), at)
+        preds = core.predict(model, rows, TZ)
+        agree = core.sanity(recs, {k: v for k, v in human.items() if v}, rows, preds)
+        if agree < core.SANITY_MIN:
+            # A broken model writes NOTHING: the previous guesses (or the rules) stand.
+            self.model = previous_model
+            # Keep the LAST GOOD run's figures: the guesses in use are still its.
+            status = self.last_status or {}
+            write_status({**status, "rejected": True, "rejected_at": at, "agree_with_rules": round(agree, 4)})
+            print(f"{at} model REJECTED: agrees with the rules on {agree:.1%} of unlabelled uses", flush=True)
+            return
+        lines = core.changed_lines([u["start"] for u in rows], preds, self.guessed(), at)
         append_lines(os.path.join(LOG_DIR, "model_labels.jsonl"), lines)
-        write_status({"trained_at": at, "labels": len(human), "accuracy": acc, "uses": len(rows)})
+        self.last_status = {"trained_at": at, "labels": len(human), "accuracy": acc, "uses": len(rows),
+                            "agree_with_rules": round(agree, 4)}
+        write_status(self.last_status)
         self.done = {u["start"] for u in rows}
         print(f"{at} retrained on {len(rows)} uses, {len(human)} labels, accuracy {acc}, {len(lines)} guesses written", flush=True)
 
