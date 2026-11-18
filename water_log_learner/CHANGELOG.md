@@ -1,3 +1,7 @@
+## 0.2.0
+
+- Sensor labels (rmaher001/ha-automations#712): washer, dishwasher, shower and bath confirmed from the house's sensors in VictoriaMetrics, written to `sensor_labels.jsonl`, trained on at weight 10. Still no options: the VictoriaMetrics address is a constant in git.
+
 ## 0.1.1
 
 - Regularised model: 0.1.0's unregularised settings diverged on the real history (84% agreement with the rules, confidently wrong).
