@@ -105,6 +105,19 @@ def test_addon_shape():
 from learner import main as learner_main  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _no_sensor_reads(monkeypatch):
+    """No test reads the real VictoriaMetrics: sensor tests install a stub."""
+    monkeypatch.setattr(learner_main, "VM_URL", None)
+
+
+@pytest.mark.requirement("water_log_learner: the sensor history address is a DNS name fixed in git, not an option")
+def test_vm_url_is_a_constant():
+    import importlib
+    fresh = importlib.reload(learner_main)
+    assert fresh.VM_URL == "http://victoriametrics.d.lan.ram6.com:8428"
+
+
 def _write_month(d, recs):
     with open(d / "2026-10.jsonl", "w") as fh:
         for r in recs:
@@ -375,3 +388,248 @@ def test_rejected_status_keeps_last_good(tmp_path, monkeypatch):
     lrn.retrain(learner_main.records())
     status = json.loads((tmp_path / "model_status.json").read_text())
     assert status["rejected"] is True and status["trained_at"] == good["trained_at"] and "rejected_at" in status
+
+
+
+# ---- sensor labels (ha-automations#712, "Sensor labels") ---------------------
+
+@pytest.mark.requirement("water_log_learner: sensor labels teach the model a kind, like Richard's do")
+def test_sensor_labels_teach():
+    h = history()
+    sens = dict([(u["start"], "washer") for u in h if u["label"] == "unknown"][:8])
+    m = core.train(h, {}, "America/Los_Angeles", sens)
+    preds = core.predict(m, [use("2026-11-02T15:00:00+00:00", "?", 125, 5.8, 2.8, 3.0)], "America/Los_Angeles")
+    assert preds[0][0] == "washer"
+
+
+@pytest.mark.requirement("water_log_learner: Richard's label beats the sensors' on the same use, and weighs more")
+def test_human_beats_sensors():
+    h = history()
+    s = h[0]["start"]
+    _rows, _X, y, w = core._dataset(h, {s: "faucet"}, "America/Los_Angeles", {s: "washer", h[1]["start"]: "washer"})
+    assert y[0] == "faucet" and w[0] == core.HUMAN_WEIGHT
+    assert y[1] == "washer" and w[1] == core.SENSOR_WEIGHT and 1.0 < core.SENSOR_WEIGHT < core.HUMAN_WEIGHT
+
+
+@pytest.mark.requirement("water_log_learner: the sanity gate leaves out sensor-labelled uses and the kinds the sensors teach")
+def test_sanity_ignores_sensor_kinds():
+    rows = [use("a", "faucet", 40, 0.9, 1.4, 1.5), use("b", "faucet", 40, 0.9, 1.4, 1.5), use("c", "flush", 18, 1.0, 3.5, 3.6)]
+    preds = [("dishwasher", 0.9), ("dishwasher", 0.9), ("flush", 0.9)]
+    assert core.sanity(rows, {}, rows, preds, {"a": "dishwasher"}) == 1.0
+    assert core.sanity(rows, {}, rows, preds) < 1.0
+
+
+def _sensor_stub(monkeypatch, calls, fail=False):
+    def fake_evidence(url, a, b):
+        calls.append((url, a, b))
+        if fail:
+            raise OSError("VictoriaMetrics unreachable")
+        return "EV"
+    monkeypatch.setattr(learner_main, "VM_URL", "http://vm.test:8428")
+    monkeypatch.setattr(learner_main, "EVIDENCE", fake_evidence)
+
+
+@pytest.mark.requirement("water_log_learner: the App writes sensor labels for all history on start, trains on them, and counts them in its status")
+def test_sensor_pass_on_start(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    h = history()
+    _write_month(tmp_path, h)
+    calls = []
+    _sensor_stub(monkeypatch, calls)
+    washers = [u["start"] for u in h if u["label"] == "unknown"][:10]
+    monkeypatch.setattr(learner_main.sensors, "label_all",
+                        lambda uses, ev: dict((u["start"], ("washer", "washer cycle")) for u in uses if u["start"] in washers))
+    lrn = learner_main.Learner()
+    lrn.tick(now=1793000000)
+    lines = [json.loads(x) for x in (tmp_path / "sensor_labels.jsonl").read_text().splitlines()]
+    assert sorted(x["start"] for x in lines) == sorted(washers)
+    assert all(x["by"] == "sensors" and x["label"] == "washer" and x["why"] == "washer cycle" for x in lines)
+    assert len(calls) == 1 and calls[0][0] == "http://vm.test:8428"
+    status = json.loads((tmp_path / "model_status.json").read_text())
+    assert status["sensor_labels"] == 10 and status["labels"] == 0
+    latest = learner_main.core.latest([json.loads(x) for x in (tmp_path / "model_labels.jsonl").read_text().splitlines()], "model_at")
+    assert sum(1 for lab in latest.values() if lab == "washer") >= 20      # the look-alikes follow
+    lrn.tick(now=1793000030)                                   # within 10 min: no second read
+    assert len(calls) == 1
+
+
+@pytest.mark.requirement("water_log_learner: every 10 minutes only the last 48 hours are re-read")
+def test_sensor_pass_recent(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    now = datetime_ts("2026-10-29T12:00:00+00:00")
+    _write_month(tmp_path, history())
+    calls = []
+    _sensor_stub(monkeypatch, calls)
+    monkeypatch.setattr(learner_main.sensors, "label_all", lambda uses, ev: {})
+    lrn = learner_main.Learner()
+    lrn.tick(now=now)
+    lrn.tick(now=now + learner_main.SENSOR_EVERY_S + 1)
+    assert len(calls) == 2
+    assert calls[0][1] == datetime_ts("2026-10-01T07:00:00+00:00")             # all history
+    assert calls[1][1] >= now - learner_main.SENSOR_RECENT_S                     # the last 48 h
+
+
+@pytest.mark.requirement("water_log_learner: VictoriaMetrics unreachable writes no sensor labels and the model still trains")
+def test_sensor_pass_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    _write_month(tmp_path, history())
+    calls = []
+    _sensor_stub(monkeypatch, calls, fail=True)
+    lrn = learner_main.Learner()
+    lrn.tick(now=1793000000)
+    assert not (tmp_path / "sensor_labels.jsonl").exists()
+    assert json.loads((tmp_path / "model_status.json").read_text())["sensor_labels"] == 0
+    lrn.tick(now=1793000000 + learner_main.SENSOR_EVERY_S + 1)              # retried at the next interval
+    assert len(calls) == 2
+
+
+@pytest.mark.requirement("water_log_learner: new sensor labels retrain the model after a quiet minute, like Richard's")
+def test_sensor_labels_retrain(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    h = history()
+    _write_month(tmp_path, h)
+    calls = []
+    _sensor_stub(monkeypatch, calls)
+    found = {}
+    monkeypatch.setattr(learner_main.sensors, "label_all", lambda uses, ev: dict(found))
+    now = datetime_ts("2026-10-29T00:00:00+00:00")
+    lrn = learner_main.Learner()
+    lrn.tick(now=now)
+    for u in [u for u in h if u["label"] == "unknown"][-2:]:  # Oct 27 and 28: inside the last 48 h
+        found[u["start"]] = ("washer", "washer cycle")
+    t = now + learner_main.SENSOR_EVERY_S + 1
+    lrn.tick(now=t)                                            # writes the labels
+    assert len((tmp_path / "sensor_labels.jsonl").read_text().splitlines()) == 2
+    written = os.path.getmtime(tmp_path / "sensor_labels.jsonl")
+    lrn.tick(now=max(t, written) + learner_main.DEBOUNCE_S + 1)
+    assert json.loads((tmp_path / "model_status.json").read_text())["sensor_labels"] == 2
+
+
+@pytest.mark.requirement("water_log_sensors: no dishwasher-plug points at all means the store did not answer: the read fails")
+def test_evidence_needs_the_plug(monkeypatch):
+    from learner import sensors
+    monkeypatch.setattr(sensors, "fetch", lambda url, match, a, b: [] if "dishwasher" in match else [(1.0, 1.0)])
+    with pytest.raises(RuntimeError):
+        sensors.evidence("http://vm.test", 0, 10)
+
+
+@pytest.mark.requirement("water_log_learner: a failed all-history sensor read is retried at the next interval, not left until the night")
+def test_failed_full_read_is_retried_in_full(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    now = datetime_ts("2026-10-29T12:00:00+00:00")
+    _write_month(tmp_path, history())
+    calls = []
+    _sensor_stub(monkeypatch, calls, fail=True)
+    lrn = learner_main.Learner()
+    lrn.tick(now=now)
+    lrn.tick(now=now + learner_main.SENSOR_EVERY_S + 1)
+    assert calls[1][1] == datetime_ts("2026-10-01T07:00:00+00:00")             # all history again
+
+
+@pytest.mark.requirement("water_log_learner: a sensor pass that fails while labelling (not only while reading) writes nothing and the pass still trains")
+def test_sensor_labelling_error_is_contained(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    _write_month(tmp_path, history())
+    calls = []
+    _sensor_stub(monkeypatch, calls)
+    def boom(uses, ev):
+        raise KeyError("median_gpm")
+    monkeypatch.setattr(learner_main.sensors, "label_all", boom)
+    lrn = learner_main.Learner()
+    lrn.tick(now=1793000000)
+    assert not (tmp_path / "sensor_labels.jsonl").exists()
+    assert (tmp_path / "model_status.json").exists()
+
+
+@pytest.mark.requirement("water_log_learner: the sanity gate still checks rule kinds the sensors teach (shower, bath): only kinds new to the rules are exempt")
+def test_sanity_checks_rule_kinds_sensors_teach():
+    rows = [use(f"f{i}", "faucet", 40, 0.9, 1.4, 1.5) for i in range(10)] + [use("s", "shower", 480, 11.0, 1.4, 4.0)]
+    broken = [("shower", 0.9)] * 11                           # calls every faucet a shower
+    assert core.sanity(rows, {}, rows, broken, {"s": "shower"}) < core.SANITY_MIN
+    new_kind = [("dishwasher", 0.9)] * 10 + [("shower", 0.9)]
+    assert core.sanity(rows, {}, rows, new_kind, {"s": "dishwasher"}) == 1.0
+
+
+
+@pytest.mark.requirement("water_log_learner: the nightly pass re-reads ALL history from the sensors")
+def test_nightly_full_sensor_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    _write_month(tmp_path, history())
+    calls = []
+    _sensor_stub(monkeypatch, calls)
+    monkeypatch.setattr(learner_main.sensors, "label_all", lambda uses, ev: {})
+    lrn = learner_main.Learner()
+    lrn.tick(now=datetime_ts("2026-10-29T10:00:00-07:00"))
+    lrn.tick(now=datetime_ts("2026-10-30T03:31:00-07:00"))
+    assert len(calls) == 2 and calls[1][1] == datetime_ts("2026-10-01T07:00:00+00:00")
+
+
+@pytest.mark.requirement("water_log_learner: with no store address the App never tries to read sensors")
+def test_no_vm_url_no_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    _write_month(tmp_path, history())
+    calls = []
+    monkeypatch.setattr(learner_main, "EVIDENCE", lambda *a: calls.append(a))
+    learner_main.Learner().tick(now=1793000000)
+    assert calls == [] and not (tmp_path / "sensor_labels.jsonl").exists()
+
+
+@pytest.mark.requirement("water_log_learner: a failed read keeps every existing sensor label (an outage is never a withdrawal)")
+def test_failed_read_keeps_labels(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    h = history()
+    _write_month(tmp_path, h)
+    before = json.dumps({"start": h[-1]["start"], "label": "washer", "why": "washer cycle", "by": "sensors",
+                         "at": "2026-10-28T00:00:00+00:00"}) + "\n"
+    (tmp_path / "sensor_labels.jsonl").write_text(before)
+    calls = []
+    _sensor_stub(monkeypatch, calls, fail=True)
+    learner_main.Learner().tick(now=1793000000)
+    assert (tmp_path / "sensor_labels.jsonl").read_text() == before
+
+
+@pytest.mark.requirement("water_log_learner: retrain passes the sensor labels to the self-check and the sanity gate, and counts only live ones")
+def test_retrain_wires_sensor_labels(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    h = history()
+    _write_month(tmp_path, h)
+    a, b = h[0]["start"], h[1]["start"]
+    (tmp_path / "sensor_labels.jsonl").write_text(
+        json.dumps({"start": a, "label": "washer", "by": "sensors", "at": "2026-10-28T00:00:00+00:00"}) + "\n" +
+        json.dumps({"start": b, "label": None, "by": "sensors", "at": "2026-10-28T00:00:00+00:00"}) + "\n")
+    seen = {}
+    real_sanity, real_check = learner_main.core.sanity, learner_main.core.self_check
+    monkeypatch.setattr(learner_main.core, "sanity", lambda *args: seen.update(sanity=args[4]) or real_sanity(*args))
+    monkeypatch.setattr(learner_main.core, "self_check",
+                        lambda *args, **kw: seen.update(check=kw.get("sensors")) or real_check(*args, **kw))
+    learner_main.Learner().retrain(learner_main.records())
+    assert seen["sanity"] == {a: "washer"} and seen["check"] == {a: "washer"}
+    assert json.loads((tmp_path / "model_status.json").read_text())["sensor_labels"] == 1
+
+
+@pytest.mark.requirement("water_log_learner: the sanity gate leaves out a sensor-labelled use even when its kind is one the rules have")
+def test_sanity_skips_sensor_rows():
+    rows = [use("a", "faucet", 40, 0.9, 1.4, 1.5), use("b", "flush", 18, 1.0, 3.5, 3.6),
+            use("c", "shower", 480, 11.0, 1.4, 4.0)]          # shower IS a rule kind here
+    preds = [("shower", 0.9), ("flush", 0.9), ("shower", 0.9)]
+    assert core.sanity(rows, {}, rows, preds, {"a": "shower"}) == 1.0
+
+
+@pytest.mark.requirement("water_log_learner: a failed write of sensor labels keeps the all-history read due and the pass still trains")
+def test_sensor_write_failure_contained(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    h = history()
+    _write_month(tmp_path, h)
+    calls = []
+    _sensor_stub(monkeypatch, calls)
+    monkeypatch.setattr(learner_main.sensors, "label_all", lambda uses, ev: {h[-1]["start"]: ("washer", "washer cycle")})
+    real = learner_main.append_lines
+
+    def append(path, lines):
+        if path.endswith("sensor_labels.jsonl"):
+            raise OSError("disk full")
+        return real(path, lines)
+    monkeypatch.setattr(learner_main, "append_lines", append)
+    lrn = learner_main.Learner()
+    lrn.tick(now=1793000000)
+    assert lrn.sensors_full is True and (tmp_path / "model_status.json").exists()

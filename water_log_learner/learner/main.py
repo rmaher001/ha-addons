@@ -4,9 +4,13 @@ Every POLL_S seconds:
   * retrain when Richard's labels changed (after DEBOUNCE_S of quiet), at
     NIGHTLY (local time) once a day, and on start; each retrain re-scores
     itself on his labels and relabels all history;
-  * otherwise label uses that appeared since the last pass.
-It appends ONLY new or changed guesses to model_labels.jsonl and rewrites
-model_status.json. It never writes the month files or labels.jsonl.
+  * otherwise label uses that appeared since the last pass;
+  * read the house's sensors (learner/sensors.py) for all history on start and
+    nightly, and for the last 48 hours every 10 minutes, appending what they
+    confirm to sensor_labels.jsonl. New sensor labels retrain like Richard's.
+It appends ONLY new or changed lines to model_labels.jsonl and
+sensor_labels.jsonl and rewrites model_status.json. It never writes the month
+files or labels.jsonl.
 """
 import glob
 import json
@@ -18,7 +22,7 @@ import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-from learner import core
+from learner import core, sensors
 
 STOP = {"now": False}
 
@@ -29,6 +33,12 @@ DEBOUNCE_S = 60
 FIRST_RETRY_S = 600          # a failed FIRST training is retried after 10 min, not every pass
 WRITING = {"now": False}     # a stop request waits only while a file is being written
 NIGHTLY = (3, 30)
+# Where the house's sensor history is kept, read only. A constant in git: an
+# add-on here has no options (README, "Update"). None = no sensor labels.
+VM_URL = "http://victoriametrics.d.lan.ram6.com:8428"
+EVIDENCE = sensors.evidence  # (vm_url, start, end) -> sensors.Evidence; raises when it cannot read
+SENSOR_EVERY_S = 600
+SENSOR_RECENT_S = 48 * 3600
 
 
 def now_iso():
@@ -119,15 +129,45 @@ class Learner:
         self.done = set()
         self.retry_after = 0.0
         self.last_status = None
+        self.sensors_next = 0.0      # when the next 48-hour sensor read is due
+        self.sensors_full = True     # read all history: on start, then nightly
+
+    def sensor_labels(self):
+        return core.latest(read_jsonl(os.path.join(LOG_DIR, "sensor_labels.jsonl")), "at")
+
+    def sensor_pass(self, recs, now, full):
+        """Append what the sensors confirm; False when it could not. Any
+        failure writes nothing: missing evidence is never taken as "it was not
+        a shower"."""
+        if VM_URL is None:
+            return True
+        try:
+            rows = core.trainable(recs)
+            if not full:
+                rows = [u for u in rows if sensors.epoch(u["start"]) >= now - SENSOR_RECENT_S]
+            if not rows:
+                return True
+            times = [sensors.epoch(u["start"]) for u in rows]
+            ev = EVIDENCE(VM_URL, min(times), max(times))
+            current = sensors.label_all(rows, ev)
+            lines = sensors.changed_lines([u["start"] for u in rows], current, self.sensor_labels(), now_iso())
+            append_lines(os.path.join(LOG_DIR, "sensor_labels.jsonl"), lines)
+        except Exception as err:
+            print(f"{now_iso()} sensor pass failed: {err!r}", flush=True)
+            return False
+        if lines:
+            print(f"{now_iso()} sensors: {len(lines)} labels written ({'all history' if full else 'last 48 h'})", flush=True)
+        return True
 
     def guessed(self):
         return core.latest(read_jsonl(os.path.join(LOG_DIR, "model_labels.jsonl")), "model_at")
 
     def retrain(self, recs):
         human = core.latest(read_jsonl(os.path.join(LOG_DIR, "labels.jsonl")), "at")
-        model = core.train(recs, human, TZ)
+        sens = dict((k, v) for k, v in self.sensor_labels().items() if v)
+        model = core.train(recs, human, TZ, sens)
         try:
-            acc = core.self_check(recs, human, TZ)
+            acc = core.self_check(recs, human, TZ, sensors=sens)
         except Exception as err:               # the score is a report, never a blocker
             print(f"{now_iso()} self-check failed: {err!r}", flush=True)
             acc = None
@@ -135,7 +175,7 @@ class Learner:
         rows = core.trainable(recs)
         at = now_iso()
         preds = core.predict(model, rows, TZ)
-        agree = core.sanity(recs, {k: v for k, v in human.items() if v}, rows, preds)
+        agree = core.sanity(recs, {k: v for k, v in human.items() if v}, rows, preds, sens)
         if agree < core.SANITY_MIN:
             # A broken model writes NOTHING: the previous guesses (or the rules) stand.
             self.model = previous_model
@@ -147,7 +187,7 @@ class Learner:
         lines = core.changed_lines([u["start"] for u in rows], preds, self.guessed(), at)
         append_lines(os.path.join(LOG_DIR, "model_labels.jsonl"), lines)
         self.last_status = {"trained_at": at, "labels": len(human), "accuracy": acc, "uses": len(rows),
-                            "agree_with_rules": round(agree, 4)}
+                            "agree_with_rules": round(agree, 4), "sensor_labels": len(sens)}
         write_status(self.last_status)
         self.done = {u["start"] for u in rows}
         print(f"{at} retrained on {len(rows)} uses, {len(human)} labels, accuracy {acc}, {len(lines)} guesses written", flush=True)
@@ -163,20 +203,32 @@ class Learner:
 
     def tick(self, now=None):
         now = now or time.time()
-        labels_m = mtime(os.path.join(LOG_DIR, "labels.jsonl"))
         local = datetime.fromtimestamp(now, ZoneInfo(TZ))
         # Only inside the hour after NIGHTLY: "any time after 3:30 on a day it has
         # not run" would fire at 10 PM on the App's first day.
         minutes = local.hour * 60 + local.minute
         start = NIGHTLY[0] * 60 + NIGHTLY[1]
         night = start <= minutes < start + 60 and self.last_night != local.date()
+        recs = records()
+        if not recs:
+            return
+        # Sensors first: on the first pass the training then already sees what
+        # they found; later, new sensor labels retrain after a quiet minute.
+        if night:
+            self.sensors_full = True
+        if night or now >= self.sensors_next:
+            full, self.sensors_full = self.sensors_full, False
+            self.sensors_next = now + SENSOR_EVERY_S
+            if not self.sensor_pass(recs, now, full) and full:
+                self.sensors_full = True     # the whole history again at the next interval
+        # Richard's labels and the sensors' both retrain; the newer file counts.
+        stamps = [m for m in (mtime(os.path.join(LOG_DIR, "labels.jsonl")),
+                              mtime(os.path.join(LOG_DIR, "sensor_labels.jsonl"))) if m is not None]
+        labels_m = max(stamps) if stamps else None
         # Quiet for a minute - or an mtime in the future (clock skew), which
         # would otherwise block retraining for good.
         quiet = labels_m is None or now - labels_m >= DEBOUNCE_S or labels_m - now > DEBOUNCE_S
         changed = labels_m != self.labels_seen and quiet
-        recs = records()
-        if not recs:
-            return
         first = self.model is None and now >= self.retry_after
         if first or changed or night:
             # Count the attempt BEFORE running it: a retrain that fails must not
@@ -201,6 +253,7 @@ def _stop(_signum, _frame):
 
 
 def main():
+    print(f"{now_iso()} started; sensor labels from {VM_URL or 'nowhere (no vm_url)'}", flush=True)
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     learner = Learner()
