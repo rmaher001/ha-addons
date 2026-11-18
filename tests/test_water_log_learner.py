@@ -97,6 +97,7 @@ def test_addon_shape():
     assert cfg["map"] == [{"type": "homeassistant_config", "read_only": False}]
     assert "options" not in cfg and "schema" not in cfg
     assert "ports" not in cfg and "host_network" not in cfg and "privileged" not in cfg
+    assert cfg["init"] is True, "a bare Python image needs the Supervisor's init for SIGTERM"
     docker = (ADDON / "Dockerfile").read_text()
     assert "scikit-learn==" in docker and "numpy==" in docker, "pinned"
 
@@ -174,3 +175,107 @@ def datetime_ts(iso):
 
 
 import os  # noqa: E402
+
+
+
+def big_history():
+    """Over 10,000 rows - the size where the library's early stopping would turn on."""
+    out = []
+    for d in range(1, 29):
+        for k in range(400):
+            m, sec = divmod(k * 7, 60)
+            out.append(use(f"2026-10-{d:02d}T{(k % 24):02d}:{m % 60:02d}:{sec:02d}+00:00",
+                           "flush" if k % 2 else "faucet", 18 if k % 2 else 40, 1.0 if k % 2 else 0.9,
+                           3.5 if k % 2 else 1.4, 3.6 if k % 2 else 1.5))
+    return out
+
+
+@pytest.mark.requirement("water_log_learner: at real size (>10k rows) a kind with ONE label from Richard trains and is guessed")
+def test_singleton_kind_at_real_size():
+    h = big_history()
+    assert len(h) > 10000
+    odd = use("2026-10-15T23:59:00+00:00", "unknown", 120, 5.6, 2.8, 3.0)
+    h.append(odd)
+    m = core.train(h, {odd["start"]: "washer"}, "America/Los_Angeles")
+    assert "washer" in list(m.classes_)
+    assert core.self_check(h, {odd["start"]: "washer"}, "America/Los_Angeles") is None   # one label: nothing to score
+
+
+@pytest.mark.requirement("water_log_learner: a null label from Richard is no label - it neither overrides nor gets his weight")
+def test_null_human_label_ignored():
+    h = history()
+    rows, X, y, w = core._dataset(h, {h[0]["start"]: None}, "America/Los_Angeles")
+    assert y[0] == h[0]["label"] and w[0] == 1.0
+
+
+@pytest.mark.requirement("water_log_learner: a duplicated start is written once per pass")
+def test_changed_lines_dedupes():
+    lines = core.changed_lines(["A", "A"], [("flush", 0.9), ("flush", 0.9)], {}, "2026-11-18T08:00:00+00:00")
+    assert len(lines) == 1
+
+
+@pytest.mark.requirement("water_log_learner: newest is decided by time, not by string ('Z' vs '+00:00')")
+def test_latest_compares_times():
+    lines = [{"start": "A", "label": "flush", "at": "2026-11-18T06:00:00.500000+00:00"},
+             {"start": "A", "label": "faucet", "at": "2026-11-18T06:00:01Z"}]
+    assert core.latest(lines, "at") == {"A": "faucet"}
+
+
+@pytest.mark.requirement("water_log_learner: the nightly retrain never fires outside 03:30-04:30")
+def test_nightly_window_bounds(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    _write_month(tmp_path, history())
+    lrn = learner_main.Learner()
+    lrn.tick(now=datetime_ts("2026-11-17T22:00:00-08:00"))      # first pass trains (no model yet)
+    calls = []
+    monkeypatch.setattr(lrn, "retrain", lambda recs: calls.append(1))
+    for iso in ("2026-11-17T22:30:00-08:00", "2026-11-18T03:29:00-08:00", "2026-11-18T04:31:00-08:00"):
+        lrn.tick(now=datetime_ts(iso))
+    assert calls == []
+
+
+@pytest.mark.requirement("water_log_learner: a failing retrain is not retried every 30 s")
+def test_failed_retrain_not_hammered(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    _write_month(tmp_path, history())
+    lrn = learner_main.Learner()
+    lrn.tick(now=1793000000)
+    (tmp_path / "labels.jsonl").write_text(json.dumps({"start": history()[0]["start"], "label": "x", "at": "2026-11-18T06:00:00+00:00"}) + "\n")
+    t0 = os.path.getmtime(tmp_path / "labels.jsonl")
+    calls = []
+
+    def boom(recs):
+        calls.append(1)
+        raise RuntimeError("fit failed")
+    monkeypatch.setattr(lrn, "retrain", boom)
+    for k in range(3):
+        try:
+            lrn.tick(now=t0 + 61 + 30 * k)
+        except RuntimeError:
+            pass
+    assert calls == [1]
+
+
+@pytest.mark.requirement("water_log_learner: deleting labels.jsonl retrains (back to the rules)")
+def test_deleted_labels_retrain(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    _write_month(tmp_path, history())
+    (tmp_path / "labels.jsonl").write_text("")
+    lrn = learner_main.Learner()
+    lrn.tick(now=1793000000)
+    calls = []
+    monkeypatch.setattr(lrn, "retrain", lambda recs: calls.append(1))
+    (tmp_path / "labels.jsonl").unlink()
+    lrn.tick(now=1793000030)
+    assert calls == [1]
+
+
+@pytest.mark.requirement("water_log_learner: a torn last line is repaired before appending; the status file is world-readable")
+def test_append_repair_and_status_mode(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    f = tmp_path / "model_labels.jsonl"
+    f.write_text('{"start": "A", "lab')
+    learner_main.append_lines(str(f), [{"start": "B", "label": "flush", "model_at": "2026-11-18T06:00:00+00:00"}])
+    assert json.loads(f.read_text().splitlines()[-1])["start"] == "B"
+    learner_main.write_status({"labels": 0})
+    assert oct((tmp_path / "model_status.json").stat().st_mode & 0o777) == "0o644"

@@ -8,7 +8,9 @@ description: >-
 url: https://github.com/rmaher001/ha-addons
 arch:
   - amd64
-init: false
+# A bare Python image has no init of its own; the Supervisor supplies one
+# (as for Alloy), so SIGTERM reaches the App and it stops between passes.
+init: true
 startup: application
 boot: auto
 # Home Assistant's /config, mounted at /homeassistant: the water log lives in

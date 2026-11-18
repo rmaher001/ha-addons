@@ -42,6 +42,7 @@ def trainable(records):
 
 
 def _dataset(records, human, tz):
+    human = {k: v for k, v in human.items() if v}       # a null label is no label
     rows = trainable(records)
     X = np.array([features(u, tz) for u in rows], dtype=float)
     y = np.array([human.get(u["start"]) or u["label"] for u in rows], dtype=object)
@@ -52,7 +53,11 @@ def _dataset(records, human, tz):
 def _fit(X, y, w):
     # min_samples_leaf counts ROWS, not weight: a kind Richard has labelled only a
     # handful of times (the new ones he teaches) must still be able to form a leaf.
-    model = HistGradientBoostingClassifier(max_iter=200, learning_rate=0.1, min_samples_leaf=3, random_state=0)
+    # early_stopping off: above 10k rows "auto" turns it on and holds out a
+    # stratified validation split, which raises on any kind with ONE example
+    # (Richard's first "washer") and would hide some of his labels from training.
+    model = HistGradientBoostingClassifier(max_iter=200, learning_rate=0.1, min_samples_leaf=3,
+                                           early_stopping=False, random_state=0)
     model.fit(X, y, sample_weight=w)
     return model
 
@@ -80,10 +85,11 @@ def apply_threshold(preds):
 def changed_lines(starts, preds, previous, model_at):
     """Append-only lines for guesses that are new or changed since `previous`
     (start -> stored label, None included)."""
-    out = []
+    out, seen = [], set()
     for start, label, (_best, p) in zip(starts, apply_threshold(preds), preds):
-        if start in previous and previous[start] == label:
+        if start in seen or (start in previous and previous[start] == label):
             continue
+        seen.add(start)
         out.append({"start": start, "label": label, "p": round(p, 3), "model_at": model_at})
     return out
 
@@ -98,9 +104,13 @@ def latest(lines, at_key):
         label = line.get("label")
         if label is not None and not isinstance(label, str):
             continue
+        try:                                   # compare TIMES, not strings ("Z" vs "+00:00")
+            at = datetime.fromisoformat(line[at_key].replace("Z", "+00:00"))
+        except ValueError:
+            continue
         cur = best.get(line["start"])
-        if cur is None or line[at_key] >= cur[0]:
-            best[line["start"]] = (line[at_key], label)
+        if cur is None or at >= cur[0]:
+            best[line["start"]] = (at, label)
     return {s: lab for s, (_a, lab) in best.items()}
 
 
@@ -109,6 +119,7 @@ def self_check(records, human, tz, folds=5):
     fewer than 2 of them. Each fold holds out some of HIS labelled uses (their
     rule-labelled copies are left out of training too) and scores the model on
     them."""
+    human = {k: v for k, v in human.items() if v}
     rows, X, y, w = _dataset(records, human, tz)
     hidx = np.array([i for i, u in enumerate(rows) if u["start"] in human])
     if len(hidx) < 2:
@@ -120,6 +131,8 @@ def self_check(records, human, tz, folds=5):
     for held in chunks:
         mask = np.ones(len(rows), dtype=bool)
         mask[held] = False
+        if len(set(y[mask])) < 2:          # a fold with one class cannot be fitted
+            return None
         model = _fit(X[mask], y[mask], w[mask])
         right += int((model.predict(X[held]) == y[held]).sum())
     return right / len(hidx)

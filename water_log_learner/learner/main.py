@@ -11,6 +11,7 @@ model_status.json. It never writes the month files or labels.jsonl.
 import glob
 import json
 import os
+import signal
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -33,7 +34,9 @@ def read_jsonl(path):
     out = []
     if not os.path.exists(path):
         return out
-    with open(path, "r", encoding="utf-8") as fh:
+    # errors="replace": a torn write that cut a multi-byte character must not
+    # fail the whole pass.
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
             try:
                 obj = json.loads(line)
@@ -72,6 +75,7 @@ def write_status(status):
     fd, tmp = tempfile.mkstemp(dir=LOG_DIR, prefix=".model_status.", suffix=".tmp")
     with os.fdopen(fd, "w") as fh:
         json.dump(status, fh, sort_keys=True)
+    os.chmod(tmp, 0o644)
     os.replace(tmp, os.path.join(LOG_DIR, "model_status.json"))
 
 
@@ -94,8 +98,13 @@ class Learner:
 
     def retrain(self, recs):
         human = core.latest(read_jsonl(os.path.join(LOG_DIR, "labels.jsonl")), "at")
-        self.model = core.train(recs, human, TZ)
-        acc = core.self_check(recs, human, TZ)
+        model = core.train(recs, human, TZ)
+        try:
+            acc = core.self_check(recs, human, TZ)
+        except Exception as err:               # the score is a report, never a blocker
+            print(f"{now_iso()} self-check failed: {err!r}", flush=True)
+            acc = None
+        self.model = model
         rows = core.trainable(recs)
         at = now_iso()
         lines = core.changed_lines([u["start"] for u in rows], core.predict(self.model, rows, TZ),
@@ -123,27 +132,45 @@ class Learner:
         minutes = local.hour * 60 + local.minute
         start = NIGHTLY[0] * 60 + NIGHTLY[1]
         night = start <= minutes < start + 60 and self.last_night != local.date()
-        changed = labels_m != self.labels_seen and (labels_m is None or now - labels_m >= DEBOUNCE_S)
+        # Quiet for a minute - or an mtime in the future (clock skew), which
+        # would otherwise block retraining for good.
+        quiet = labels_m is None or now - labels_m >= DEBOUNCE_S or labels_m - now > DEBOUNCE_S
+        changed = labels_m != self.labels_seen and quiet
         recs = records()
         if not recs:
             return
         if self.model is None or changed or night:
-            self.retrain(recs)
+            # Count the attempt BEFORE running it: a retrain that fails must not
+            # be retried at full cost every 30 s (the next label or night retries).
             self.labels_seen = labels_m
             if night:
                 self.last_night = local.date()
+            self.retrain(recs)
         else:
             self.label_new(recs)
 
 
+STOP = {"now": False}
+
+
+def _stop(_signum, _frame):
+    STOP["now"] = True                      # finish the current pass, then exit
+
+
 def main():
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
     learner = Learner()
-    while True:
+    while not STOP["now"]:
         try:
             learner.tick()
         except Exception as err:          # one bad pass must not end the App
             print(f"{now_iso()} pass failed: {err!r}", flush=True)
-        time.sleep(POLL_S)
+        for _ in range(POLL_S):
+            if STOP["now"]:
+                break
+            time.sleep(1)
+    print(f"{now_iso()} stopped", flush=True)
 
 
 if __name__ == "__main__":
