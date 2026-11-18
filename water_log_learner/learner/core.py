@@ -86,13 +86,17 @@ SANITY_MIN = 0.95
 
 
 def sanity(records, human, preds_rows, preds):
-    """Agreement with the rule label on the uses Richard has NOT labelled and the
-    rules did NOT call unknown. Resolving the rules' unknowns (and spreading his
-    new kinds to look-alikes) is the point, so those are left out; on the rest a
-    healthy model agrees almost everywhere. The diverged 0.1.0 model scored 0.888 on the real history (2026-11-17);
-    a healthy one 1.0."""
+    """Agreement with the rule label on uses Richard has NOT labelled, the rules
+    did NOT call unknown, and where the model did NOT pick a kind he taught.
+
+    Spreading his corrections to look-alikes (200 rule "faucet" relabelled
+    "washer" moves their twins too) and resolving the rules' unknowns is the
+    point of labelling, so neither counts. What is left is divergence on kinds
+    he never touched - the 0.1.0 failure: it scored 0.888 here on the real
+    history (2026-11-17); a healthy model scores 1.0."""
+    taught = set([v for v in human.values() if v])
     pairs = [(u["label"], lab) for u, (lab, _p) in zip(preds_rows, preds)
-             if u["start"] not in human and u["label"] != "unknown"]
+             if u["start"] not in human and u["label"] != "unknown" and lab not in taught]
     return sum(1 for a, b in pairs if a == b) / len(pairs) if pairs else 1.0
 
 

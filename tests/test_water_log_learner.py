@@ -343,3 +343,35 @@ def test_sanity_gate_rejects_a_broken_model(tmp_path, monkeypatch):
 def test_sanity_ignores_labelled_and_unknown():
     rows = [use("A", "faucet", 10, 1, 1, 1), use("B", "faucet", 10, 1, 1, 1), use("C", "unknown", 10, 1, 1, 1)]
     assert core.sanity(rows, {"A": "washer"}, rows, [("washer", 1.0), ("faucet", 1.0), ("washer", 1.0)]) == 1.0
+
+
+
+@pytest.mark.requirement("water_log_learner: bulk-teaching a new kind out of a rule kind is ACCEPTED, not rejected by the gate")
+def test_gate_accepts_bulk_teaching():
+    rows = []
+    for k in range(1000):
+        washer = k % 10 < 3                              # 300 of the rule "faucets" are really a washer
+        day, sec = divmod(k, 40)
+        rows.append(use(f"2026-10-{1 + day % 28:02d}T{8 + sec % 12:02d}:{sec:02d}:{k % 60:02d}+00:00", "faucet",
+                        120 if washer else 40, 5.6 if washer else 0.9, 2.8 if washer else 1.4, 3.0 if washer else 1.5))
+    rows += history()
+    human = dict([(u["start"], "washer") for u in rows if u["duration_s"] == 120][:30])
+    m = core.train(rows, human, "America/Los_Angeles")
+    tr = core.trainable(rows)
+    preds = core.predict(m, tr, "America/Los_Angeles")
+    moved = sum(1 for u, (lab, _p) in zip(tr, preds) if u["duration_s"] == 120 and u["start"] not in human and lab == "washer")
+    assert moved > 200, "the look-alikes follow his labels"
+    assert core.sanity(rows, human, tr, preds) >= core.SANITY_MIN
+
+
+@pytest.mark.requirement("water_log_learner: a rejected run keeps the last good run's figures and says when it was rejected")
+def test_rejected_status_keeps_last_good(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    _write_month(tmp_path, history())
+    lrn = learner_main.Learner()
+    lrn.tick(now=1793000000)
+    good = json.loads((tmp_path / "model_status.json").read_text())
+    monkeypatch.setattr(learner_main.core, "predict", lambda model, rows, tz: [("faucet", 1.0) for _ in rows])
+    lrn.retrain(learner_main.records())
+    status = json.loads((tmp_path / "model_status.json").read_text())
+    assert status["rejected"] is True and status["trained_at"] == good["trained_at"] and "rejected_at" in status
