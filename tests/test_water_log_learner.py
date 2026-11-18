@@ -324,3 +324,22 @@ def test_stop_during_write_finishes_the_line(tmp_path, monkeypatch):
         assert json.loads(f.read_text().splitlines()[-1])["start"] == "B"
     finally:
         learner_main.STOP["now"] = False
+
+
+@pytest.mark.requirement("water_log_learner: a model that disagrees with the rules on unlabelled uses writes NOTHING and is marked rejected")
+def test_sanity_gate_rejects_a_broken_model(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    _write_month(tmp_path, history())
+    lrn = learner_main.Learner()
+    monkeypatch.setattr(learner_main.core, "predict", lambda model, rows, tz: [("faucet", 1.0) for _ in rows])
+    lrn.tick(now=1793000000)
+    assert not (tmp_path / "model_labels.jsonl").exists()
+    status = json.loads((tmp_path / "model_status.json").read_text())
+    assert status["rejected"] is True and status["agree_with_rules"] < 0.95
+    assert lrn.model is None
+
+
+@pytest.mark.requirement("water_log_learner: sanity ignores uses Richard labelled and the rules' unknowns (they are SUPPOSED to change)")
+def test_sanity_ignores_labelled_and_unknown():
+    rows = [use("A", "faucet", 10, 1, 1, 1), use("B", "faucet", 10, 1, 1, 1), use("C", "unknown", 10, 1, 1, 1)]
+    assert core.sanity(rows, {"A": "washer"}, rows, [("washer", 1.0), ("faucet", 1.0), ("washer", 1.0)]) == 1.0

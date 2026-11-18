@@ -1,5 +1,5 @@
 name: Water log learner
-version: "0.1.0"
+version: "0.1.1"
 slug: water_log_learner
 description: >-
   Learns Richard's water-use labels and labels the house's water log
