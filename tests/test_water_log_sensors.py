@@ -224,7 +224,7 @@ def test_evidence_margin(monkeypatch):
     seen = []
     monkeypatch.setattr(sensors, "fetch", lambda url, match, a, b: seen.append((a, b)) or [(1.0, 1.0)])
     sensors.evidence("http://vm.test", 100000, 200000)
-    assert set(seen) == {(100000 - 6 * 3600, 200000 + 6 * 3600)} and len(seen) == 4
+    assert set(seen) == {(100000 - 6 * 3600, 200000 + 6 * 3600)} and len(seen) == len(sensors.SERIES)
 
 
 @pytest.mark.requirement("water_log_sensors: fetch posts the series and range to /api/v1/export and parses the answer")
@@ -252,9 +252,157 @@ def test_fetch(monkeypatch):
 
 @pytest.mark.requirement("water_log_sensors: over a long range every series must answer; a missing washer or motion series fails the read instead of withdrawing labels")
 def test_long_read_needs_every_series(monkeypatch):
-    for missing in ("top_load_washer", "master_bathroom", "upstairs_bathroom"):
+    for missing in ("top_load_washer", "master_bathroom_shower", "upstairs_bathroom_shower"):
         monkeypatch.setattr(sensors, "fetch", lambda url, match, a, b, m=missing: [] if m in match else [(1.0, 1.0)])
         with pytest.raises(RuntimeError):
             sensors.evidence("http://vm.test", 0, 30 * 86400)
     monkeypatch.setattr(sensors, "fetch", lambda url, match, a, b: [] if "top_load_washer" in match else [(1.0, 1.0)])
     sensors.evidence("http://vm.test", 0, 2 * 86400)          # two days with no laundry is normal
+
+
+@pytest.mark.requirement("water_log_sensors: an empty room series never fails the read (labels still flow); over a long read it marks the rooms unusable")
+def test_empty_room_series_skips_rooms(monkeypatch):
+    for missing in ("toilet_plug", "toilet_motion", "master_bathroom_presence", "upstairs_bathroom_motion_motion",
+                    "upstairs_bathroom_presence"):
+        monkeypatch.setattr(sensors, "fetch", lambda url, match, a, b, m=missing: [] if m in match else [(1.0, 1.0)])
+        assert sensors.evidence("http://vm.test", 0, 30 * 86400).rooms_ok is False
+        assert sensors.evidence("http://vm.test", 0, 2 * 86400).rooms_ok is True     # a quiet two days is normal
+    monkeypatch.setattr(sensors, "fetch", lambda url, match, a, b: [(1.0, 1.0)])
+    assert sensors.evidence("http://vm.test", 0, 30 * 86400).rooms_ok is True
+
+
+# ---- rooms (ha-automations#712, "Room column") ----------------------------------
+# A plug on one toilet's seat bursts several hundred watts around a flush.
+# Times and values here are invented.
+
+from datetime import datetime, timezone  # noqa: E402
+
+T0 = ts("2026-06-04T15:00:00+00:00")
+
+
+def flush(t, gal=0.8):
+    u = use(datetime.fromtimestamp(t, tz=timezone.utc).isoformat(), 15, gal, 3.4, 3.6)
+    u["label"] = "flush"
+    return u
+
+
+def rooms_ev(toilet=(), master=(), upstairs=(), master_shower=(), upstairs_shower=()):
+    return sensors.Evidence(washer=[], dishwasher=[], master=list(master_shower), upstairs=list(upstairs_shower),
+                            toilet=list(toilet), master_near=(list(master), []), upstairs_near=([], list(upstairs)))
+
+
+@pytest.mark.requirement("water_log_sensors: a flush with the toilet seat's plug bursting around it is the master bathroom")
+def test_flush_with_plug_burst_is_master():
+    ev = rooms_ev(toilet=[(T0 - 150, 2.0), (T0 - 120, 480.0), (T0 - 100, 25.0)])
+    assert sensors.sensor_room(flush(T0), ev) == ("master", "toilet plug")
+
+
+@pytest.mark.requirement("water_log_sensors: a plug burst already on at the window's start counts while its reading is under 4 minutes older than the window")
+def test_plug_burst_carried_in():
+    a = T0 - sensors.TOILET_BEFORE_S
+    assert sensors.sensor_room(flush(T0), rooms_ev(toilet=[(a - 200, 480.0)])) == ("master", "toilet plug")
+    assert sensors.sensor_room(flush(T0), rooms_ev(toilet=[(a - 300, 480.0)])) is None
+
+
+@pytest.mark.requirement("water_log_sensors: master presence (the second master series) places a flush too")
+def test_master_presence_places_a_flush():
+    ev = sensors.Evidence(washer=[], dishwasher=[], master=[], upstairs=[], toilet=[],
+                          master_near=([], [(T0 - 100, 1)]), upstairs_near=([], []))
+    assert sensors.sensor_room(flush(T0), ev) == ("master", "master bathroom motion")
+
+
+@pytest.mark.requirement("water_log_sensors: a flush-shaped use the sensors call washer or dishwasher gets no room")
+def test_appliance_fill_gets_no_room():
+    from datetime import datetime as dt
+    t = WASHER_CHANGES[2] + 60
+    u = use(dt.fromtimestamp(t, tz=timezone.utc).isoformat(), 60, 6.0, 6.0)
+    u["label"] = "flush"
+    ev = evidence()._replace(toilet=[(t - 60, 480.0)], master_near=([], []), upstairs_near=([], []))
+    assert sensors.sensor_label(u, ev)[0] == "washer"
+    assert sensors.sensor_room(u, ev) is None
+
+
+@pytest.mark.requirement("water_log_sensors: the plug's idle seat warmer (under 50 W) is not a burst")
+def test_idle_plug_is_not_a_burst():
+    ev = rooms_ev(toilet=[(T0 - 100, 12.8), (T0 + 10, 30.0)])
+    assert sensors.sensor_room(flush(T0), ev) is None
+
+
+@pytest.mark.requirement("water_log_sensors: a plug burst long before the flush (over 4 minutes) does not count")
+def test_old_plug_burst_does_not_count():
+    ev = rooms_ev(toilet=[(T0 - 600, 480.0)])
+    assert sensors.sensor_room(flush(T0), ev) is None
+    ev = rooms_ev(toilet=[(T0 + 120, 480.0)])                    # and nor does one well after it
+    assert sensors.sensor_room(flush(T0), ev) is None
+
+
+@pytest.mark.requirement("water_log_sensors: master bathroom motion with no plug burst is still the master bathroom")
+def test_flush_with_master_motion_is_master():
+    ev = rooms_ev(master=[(T0 - 200, 1), (T0 + 20, 0)])
+    assert sensors.sensor_room(flush(T0), ev) == ("master", "master bathroom motion")
+
+
+@pytest.mark.requirement("water_log_sensors: a flush with only upstairs motion is the upstairs bathroom")
+def test_flush_with_upstairs_motion_is_upstairs():
+    ev = rooms_ev(upstairs=[(T0 - 90, 1), (T0 + 40, 0)])
+    assert sensors.sensor_room(flush(T0, 1.8), ev) == ("upstairs", "upstairs bathroom motion")
+
+
+@pytest.mark.requirement("water_log_sensors: someone in both bathrooms, or in neither, gives a flush no room")
+def test_flush_room_needs_one_bathroom():
+    both = rooms_ev(toilet=[(T0 - 60, 480.0)], upstairs=[(T0 - 60, 1)])
+    assert sensors.sensor_room(flush(T0), both) is None
+    assert sensors.sensor_room(flush(T0), rooms_ev()) is None
+
+
+@pytest.mark.requirement("water_log_sensors: motion more than 5 minutes before a flush, or over a minute after, does not place it")
+def test_flush_motion_window():
+    assert sensors.sensor_room(flush(T0), rooms_ev(upstairs=[(T0 - 400, 1), (T0 - 380, 0)])) is None
+    assert sensors.sensor_room(flush(T0), rooms_ev(upstairs=[(T0 + 90, 1)])) is None
+
+
+@pytest.mark.requirement("water_log_sensors: a sensor-confirmed shower or bath takes the room of the shower motion that confirmed it")
+def test_shower_and_bath_rooms():
+    u = use(datetime.fromtimestamp(T0, tz=timezone.utc).isoformat(), 600, 20.0, 2.0)
+    assert sensors.sensor_room(u, rooms_ev(master_shower=[(T0 - 30, 1)])) == ("master", "master shower motion")
+    bath = use(u["start"], 1200, 50.0, 2.5)
+    assert sensors.sensor_room(bath, rooms_ev(upstairs_shower=[(T0 - 30, 1)])) == ("upstairs", "upstairs shower motion")
+
+
+@pytest.mark.requirement("water_log_sensors: uses the sensors do not confirm as shower or bath, and are not flushes, get no room")
+def test_other_uses_get_no_room():
+    sink = use(datetime.fromtimestamp(T0, tz=timezone.utc).isoformat(), 20, 0.4, 1.3)
+    sink["label"] = "faucet"
+    assert sensors.sensor_room(sink, rooms_ev(toilet=[(T0 - 60, 480.0)], master=[(T0 - 60, 1)])) is None
+    short = use(sink["start"], 60, 2.5, 4.3)                    # in the shower room but too short to be a shower
+    assert sensors.sensor_room(short, rooms_ev(upstairs_shower=[(T0 - 30, 1)])) is None
+
+
+@pytest.mark.requirement("water_log_sensors: a tiny flush-labelled blip gets no room")
+def test_tiny_gets_no_room():
+    u = flush(T0, 0.05)
+    assert sensors.sensor_room(u, rooms_ev(toilet=[(T0 - 60, 480.0)])) is None
+
+
+@pytest.mark.requirement("water_log_sensors: room_all maps each placed use to (room, why)")
+def test_room_all():
+    ev = rooms_ev(toilet=[(T0 - 60, 480.0)])
+    a, b = flush(T0), flush(T0 + 3600)
+    assert sensors.room_all([a, b], ev) == {a["start"]: ("master", "toilet plug")}
+
+
+@pytest.mark.requirement("water_log_sensors: room lines carry a room key, are written only when new or changed, and withdraw with room None")
+def test_room_changed_lines():
+    at = "2026-06-04T00:00:00+00:00"
+    lines = sensors.changed_lines(["a", "b", "c"], {"a": ("master", "toilet plug"), "b": ("upstairs", "x")},
+                                  {"b": "upstairs", "c": "master"}, at, key="room")
+    assert lines == [{"start": "a", "room": "master", "why": "toilet plug", "by": "sensors", "at": at},
+                     {"start": "c", "room": None, "why": None, "by": "sensors", "at": at}]
+
+
+@pytest.mark.requirement("water_log_sensors: evidence carries the toilet plug and each bathroom's motion and presence")
+def test_evidence_rooms(monkeypatch):
+    monkeypatch.setattr(sensors, "fetch", lambda url, match, a, b: [(1.0, 7.0 if "toilet_plug" in match else 1.0)])
+    ev = sensors.evidence("http://vm.test", 100000, 200000)
+    assert ev.toilet == [(1.0, 7.0)]
+    assert len(ev.master_near) == 2 and len(ev.upstairs_near) == 2

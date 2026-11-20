@@ -13,6 +13,11 @@ Evidence, all kept in VictoriaMetrics since 2026-03-16:
   * showers - the shower motion sensor in the master and upstairs bathrooms.
     The master bathroom has no tub; the upstairs one is shower or bath by size
     (Richard, 2026-11-18).
+
+Rooms (plan section "Room column"): which bathroom a shower, bath or flush was
+in, written apart from the labels and never trained on. A flush is placed by a
+plug on the master toilet's seat, whose heater bursts several hundred watts
+around a flush, and by each bathroom's motion and presence sensors.
 """
 import bisect
 import json
@@ -21,13 +26,23 @@ import urllib.request
 from collections import namedtuple
 from datetime import datetime
 
-Evidence = namedtuple("Evidence", "washer dishwasher master upstairs")
+# master/upstairs: shower motion. toilet: the master toilet plug's watts.
+# master_near/upstairs_near: every other motion or presence series per bathroom.
+# rooms_ok False: a room series did not answer over a long read; place nothing.
+Evidence = namedtuple("Evidence", "washer dishwasher master upstairs toilet master_near upstairs_near rooms_ok",
+                      defaults=((), (), (), True))
+ROOM_SERIES = ("toilet", "master_toilet", "master_presence", "upstairs_motion", "upstairs_presence")
 
 SERIES = {
     "washer": '{__name__="units_state",entity_id="top_load_washer_current_status"}',
     "dishwasher": '{__name__="W_value",entity_id="kitchen_dishwasher_plug_power"}',
     "master": '{__name__="units_value",entity_id="master_bathroom_shower_motion_occupancy"}',
     "upstairs": '{__name__="units_value",entity_id="upstairs_bathroom_shower_motion_occupancy"}',
+    "toilet": '{__name__="W_value",entity_id="master_bathroom_toilet_plug_power"}',
+    "master_toilet": '{__name__="units_value",entity_id="master_bathroom_toilet_motion_occupancy"}',
+    "master_presence": '{__name__="units_value",entity_id="master_bathroom_presence_filtered"}',
+    "upstairs_motion": '{__name__="units_value",entity_id="upstairs_bathroom_motion_motion"}',
+    "upstairs_presence": '{__name__="units_value",entity_id="upstairs_bathroom_presence_filtered"}',
 }
 
 MARGIN_S = 6 * 3600
@@ -55,6 +70,12 @@ MOTION_BEFORE_S, MOTION_AFTER_S = 180, 120
 MOTION_STALE_S = 30 * 60
 SHOWER_MIN_S, SHOWER_MIN_GAL = 180, 3.0
 BATH_MIN_GAL, BATH_MIN_S = 40.0, 15 * 60
+
+# Flush rooms. The plug idles well under 50 W (seat warmer); its heater bursts
+# start a few minutes before the flush and end soon after. Bathroom motion or presence
+# counts from 5 min before to 1 min after the water starts.
+TOILET_W, TOILET_BEFORE_S, TOILET_AFTER_S = 50.0, 240, 60
+NEAR_BEFORE_S, NEAR_AFTER_S = 300, 60
 
 
 def epoch(iso):
@@ -98,20 +119,26 @@ def _inside(t, spans):
     return any(a <= t <= b for a, b in spans)
 
 
-def _active(points, a, b):
-    """Motion on at any moment in [a, b]: an "on" sample inside, or the last
-    sample before `a` was "on" (the sensor reports changes, not a heartbeat)
-    and no older than MOTION_STALE_S."""
+def _active(points, a, b, above=0.5, stale=MOTION_STALE_S):
+    """On at any moment in [a, b]: a sample at or above `above` inside, or the
+    last sample before `a` was (the sensors report changes, not a heartbeat)
+    and no older than `stale`."""
     times = [t for t, _v in points]
     i = bisect.bisect_left(times, a)
-    if i > 0 and points[i - 1][1] >= 0.5 and a - points[i - 1][0] <= MOTION_STALE_S:
+    if i > 0 and points[i - 1][1] >= above and a - points[i - 1][0] <= stale:
         return True
     j = i
     while j < len(points) and points[j][0] <= b:
-        if points[j][1] >= 0.5:
+        if points[j][1] >= above:
             return True
         j += 1
     return False
+
+
+def _shower_rooms(u, ev):
+    t = epoch(u["start"])
+    return [room for room in ("master", "upstairs")
+            if _active(getattr(ev, room), t - MOTION_BEFORE_S, t + MOTION_AFTER_S)]
 
 
 def sensor_label(u, ev):
@@ -120,8 +147,7 @@ def sensor_label(u, ev):
     if gal < MIN_GALLONS or u.get("label") == "tiny":
         return None
     t = epoch(u["start"])
-    window = (t - MOTION_BEFORE_S, t + MOTION_AFTER_S)
-    rooms = [room for room in ("master", "upstairs") if _active(getattr(ev, room), *window)]
+    rooms = _shower_rooms(u, ev)
     if len(rooms) > 1:
         return None
     washer = _inside(t, ev.washer) and gal >= WASHER_MIN_GAL and med >= WASHER_MIN_GPM
@@ -153,18 +179,50 @@ def label_all(uses, ev):
     return out
 
 
-def changed_lines(starts, current, previous, at):
-    """Append-only lines: a label that is new or different, and a withdrawal
-    (label None) for one the sensors no longer support."""
+def sensor_room(u, ev):
+    """(room, why) - "master" or "upstairs" - for a sensor-confirmed shower or
+    bath, or a flush; None when no bathroom, or both, fit."""
+    if float(u["gallons"]) < MIN_GALLONS or u.get("label") == "tiny":
+        return None
+    got = sensor_label(u, ev)
+    if got and got[0] in ("shower", "bath"):
+        return (_shower_rooms(u, ev)[0], got[1])
+    if got or u.get("label") != "flush":      # an appliance fill is in no bathroom
+        return None
+    t = epoch(u["start"])
+    a, b = t - NEAR_BEFORE_S, t + NEAR_AFTER_S
+    plug = _active(ev.toilet, t - TOILET_BEFORE_S, t + TOILET_AFTER_S, above=TOILET_W, stale=TOILET_BEFORE_S)
+    master = plug or any(_active(p, a, b) for p in ev.master_near)
+    upstairs = any(_active(p, a, b) for p in ev.upstairs_near)
+    if master == upstairs:
+        return None
+    if master:
+        return ("master", "toilet plug" if plug else "master bathroom motion")
+    return ("upstairs", "upstairs bathroom motion")
+
+
+def room_all(uses, ev):
+    """start -> (room, why) for every use the sensors place."""
+    out = {}
+    for u in uses:
+        got = sensor_room(u, ev)
+        if got:
+            out[u["start"]] = got
+    return out
+
+
+def changed_lines(starts, current, previous, at, key="label"):
+    """Append-only lines: a `key` value (label or room) that is new or
+    different, and a withdrawal (None) for one the sensors no longer support."""
     out, seen = [], set()
     for start in starts:
         if start in seen:
             continue
         seen.add(start)
-        label, why = current.get(start, (None, None))
-        if previous.get(start) == label:      # also skips "no label" for a use never labelled
+        value, why = current.get(start, (None, None))
+        if previous.get(start) == value:      # also skips "nothing" for a use never given one
             continue
-        out.append({"start": start, "label": label, "why": why, "by": "sensors", "at": at})
+        out.append({"start": start, key: value, "why": why, "by": "sensors", "at": at})
     return out
 
 
@@ -207,9 +265,15 @@ def evidence(vm_url, start, end):
     # Over a long read every series has points (laundry and showers happen
     # weekly): an empty one is a renamed or missing series, and reading it as
     # "nothing happened" would withdraw every label of that kind.
+    # Room series never fail the read (labels must still flow): an empty one
+    # over a long read only stops rooms being placed or withdrawn.
+    rooms_ok = True
     if b - a > LONG_READ_S:
-        empty = [k for k, pts in got.items() if not pts]
+        empty = [k for k, pts in got.items() if not pts and k not in ROOM_SERIES]
         if empty:
             raise RuntimeError(f"no points for {', '.join(empty)} over {int((b - a) / 86400)} days")
+        rooms_ok = all(got[k] for k in ROOM_SERIES)
     return Evidence(washer=cycles([t for t, _v in got["washer"]]), dishwasher=runs(got["dishwasher"]),
-                    master=got["master"], upstairs=got["upstairs"])
+                    master=got["master"], upstairs=got["upstairs"], toilet=got["toilet"],
+                    master_near=(got["master_toilet"], got["master_presence"]),
+                    upstairs_near=(got["upstairs_motion"], got["upstairs_presence"]), rooms_ok=rooms_ok)
