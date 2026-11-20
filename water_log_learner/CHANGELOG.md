@@ -1,3 +1,7 @@
+## 0.3.0
+
+- Rooms (rmaher001/ha-automations#712): showers, baths and flushes placed in the master or upstairs bathroom from the master toilet's plug and each bathroom's motion and presence, written to `room_labels.jsonl`. Never trained on.
+
 ## 0.2.0
 
 - Sensor labels (rmaher001/ha-automations#712): washer, dishwasher, shower and bath confirmed from the house's sensors in VictoriaMetrics, written to `sensor_labels.jsonl`, trained on at weight 10. Still no options: the VictoriaMetrics address is a constant in git.

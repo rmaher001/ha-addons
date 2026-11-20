@@ -7,9 +7,11 @@ Every POLL_S seconds:
   * otherwise label uses that appeared since the last pass;
   * read the house's sensors (learner/sensors.py) for all history on start and
     nightly, and for the last 48 hours every 10 minutes, appending what they
-    confirm to sensor_labels.jsonl. New sensor labels retrain like Richard's.
-It appends ONLY new or changed lines to model_labels.jsonl and
-sensor_labels.jsonl and rewrites model_status.json. It never writes the month
+    confirm to sensor_labels.jsonl and the bathroom they place a shower, bath
+    or flush in to room_labels.jsonl. New sensor labels retrain like
+    Richard's; rooms never train.
+It appends ONLY new or changed lines to model_labels.jsonl, sensor_labels.jsonl
+and room_labels.jsonl and rewrites model_status.json. It never writes the month
 files or labels.jsonl.
 """
 import glob
@@ -135,6 +137,9 @@ class Learner:
     def sensor_labels(self):
         return core.latest(read_jsonl(os.path.join(LOG_DIR, "sensor_labels.jsonl")), "at")
 
+    def room_labels(self):
+        return core.latest(read_jsonl(os.path.join(LOG_DIR, "room_labels.jsonl")), "at", key="room")
+
     def sensor_pass(self, recs, now, full):
         """Append what the sensors confirm; False when it could not. Any
         failure writes nothing: missing evidence is never taken as "it was not
@@ -149,14 +154,22 @@ class Learner:
                 return True
             times = [sensors.epoch(u["start"]) for u in rows]
             ev = EVIDENCE(VM_URL, min(times), max(times))
-            current = sensors.label_all(rows, ev)
-            lines = sensors.changed_lines([u["start"] for u in rows], current, self.sensor_labels(), now_iso())
+            starts, at = [u["start"] for u in rows], now_iso()
+            # Both worked out before either is written.
+            lines = sensors.changed_lines(starts, sensors.label_all(rows, ev), self.sensor_labels(), at)
+            rooms = []
+            if getattr(ev, "rooms_ok", True):
+                rooms = sensors.changed_lines(starts, sensors.room_all(rows, ev), self.room_labels(), at, key="room")
+            else:
+                print(f"{at} rooms skipped: a room series returned nothing over the full read", flush=True)
             append_lines(os.path.join(LOG_DIR, "sensor_labels.jsonl"), lines)
+            append_lines(os.path.join(LOG_DIR, "room_labels.jsonl"), rooms)
         except Exception as err:
             print(f"{now_iso()} sensor pass failed: {err!r}", flush=True)
             return False
-        if lines:
-            print(f"{now_iso()} sensors: {len(lines)} labels written ({'all history' if full else 'last 48 h'})", flush=True)
+        if lines or rooms:
+            print(f"{now_iso()} sensors: {len(lines)} labels, {len(rooms)} rooms written "
+                  f"({'all history' if full else 'last 48 h'})", flush=True)
         return True
 
     def guessed(self):

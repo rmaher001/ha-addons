@@ -1,10 +1,11 @@
 name: Water log learner
-version: "0.2.0"
+version: "0.3.0"
 slug: water_log_learner
 description: >-
   Learns Richard's water-use labels and labels the house's water log
   (rmaher001/ha-automations#712). Reads /config/water_log; writes only
-  model_labels.jsonl, sensor_labels.jsonl and model_status.json there. Reads
+  model_labels.jsonl, sensor_labels.jsonl, room_labels.jsonl and
+  model_status.json there. Reads
   the house's sensor history from VictoriaMetrics to confirm uses.
 url: https://github.com/rmaher001/ha-addons
 arch:
@@ -15,8 +16,9 @@ init: true
 startup: application
 boot: auto
 # Home Assistant's /config, mounted at /homeassistant: the water log lives in
-# /config/water_log. Read-write only because the App writes its two files
-# there (model_labels.jsonl, sensor_labels.jsonl, model_status.json); it never
+# /config/water_log. Read-write only because the App writes its own files
+# there (model_labels.jsonl, sensor_labels.jsonl, room_labels.jsonl,
+# model_status.json); it never
 # writes anything else.
 map:
   - type: homeassistant_config

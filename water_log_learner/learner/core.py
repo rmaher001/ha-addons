@@ -135,14 +135,14 @@ def changed_lines(starts, preds, previous, model_at):
     return out
 
 
-def latest(lines, at_key):
-    """start -> label, newest `at_key` per start; malformed lines skipped."""
+def latest(lines, at_key, key="label"):
+    """start -> `key` (label, or room), newest `at_key` per start; malformed lines skipped."""
     best = {}
     for line in lines:
         if (not isinstance(line, dict) or not isinstance(line.get("start"), str)
                 or not isinstance(line.get(at_key), str)):
             continue
-        label = line.get("label")
+        label = line.get(key)
         if label is not None and not isinstance(label, str):
             continue
         try:                                   # compare TIMES, not strings ("Z" vs "+00:00")

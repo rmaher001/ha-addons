@@ -427,6 +427,8 @@ def _sensor_stub(monkeypatch, calls, fail=False):
         return "EV"
     monkeypatch.setattr(learner_main, "VM_URL", "http://vm.test:8428")
     monkeypatch.setattr(learner_main, "EVIDENCE", fake_evidence)
+    # The fake evidence is a bare string: rooms are faked too unless a test sets its own.
+    monkeypatch.setattr(learner_main.sensors, "room_all", lambda uses, ev: {})
 
 
 @pytest.mark.requirement("water_log_learner: the App writes sensor labels for all history on start, trains on them, and counts them in its status")
@@ -633,3 +635,119 @@ def test_sensor_write_failure_contained(tmp_path, monkeypatch):
     lrn = learner_main.Learner()
     lrn.tick(now=1793000000)
     assert lrn.sensors_full is True and (tmp_path / "model_status.json").exists()
+
+
+@pytest.mark.requirement("water_log_learner: the sensor pass writes rooms to room_labels.jsonl, only changes, and never retrains on them")
+def test_sensor_pass_writes_rooms(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    h = history()
+    _write_month(tmp_path, h)
+    calls = []
+    _sensor_stub(monkeypatch, calls)
+    monkeypatch.setattr(learner_main.sensors, "label_all", lambda uses, ev: {})
+    placed = [u["start"] for u in h][:3]
+    monkeypatch.setattr(learner_main.sensors, "room_all",
+                        lambda uses, ev: dict((s, ("master", "toilet plug")) for s in placed))
+    lrn = learner_main.Learner()
+    now = 1793000000
+    lrn.tick(now=now)
+    lines = [json.loads(x) for x in (tmp_path / "room_labels.jsonl").read_text().splitlines()]
+    assert sorted(x["start"] for x in lines) == sorted(placed)
+    assert all(x["room"] == "master" and x["by"] == "sensors" for x in lines)
+    trained = json.loads((tmp_path / "model_status.json").read_text())["trained_at"]
+    lrn.sensors_full = True
+    lrn.tick(now=now + learner_main.SENSOR_EVERY_S + 1)                       # same rooms: nothing new
+    assert len((tmp_path / "room_labels.jsonl").read_text().splitlines()) == 3
+    lrn.tick(now=now + learner_main.SENSOR_EVERY_S + learner_main.DEBOUNCE_S + 60)
+    assert json.loads((tmp_path / "model_status.json").read_text())["trained_at"] == trained   # rooms never retrain
+
+
+@pytest.mark.requirement("water_log_learner: a failure while placing rooms writes no rooms and keeps the all-history read due")
+def test_room_failure_contained(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    _write_month(tmp_path, history())
+    calls = []
+    _sensor_stub(monkeypatch, calls)
+    monkeypatch.setattr(learner_main.sensors, "label_all", lambda uses, ev: {})
+
+    def boom(uses, ev):
+        raise KeyError("gallons")
+    monkeypatch.setattr(learner_main.sensors, "room_all", boom)
+    lrn = learner_main.Learner()
+    lrn.tick(now=1793000000)
+    assert not (tmp_path / "room_labels.jsonl").exists()
+    assert lrn.sensors_full is True and (tmp_path / "model_status.json").exists()
+
+
+@pytest.mark.requirement("water_log_learner: a room line written after training never retrains the model (only labels and sensor labels do)")
+def test_room_file_never_retrains(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    h = history()
+    _write_month(tmp_path, h)
+    calls = []
+    _sensor_stub(monkeypatch, calls)
+    monkeypatch.setattr(learner_main.sensors, "label_all", lambda uses, ev: {})
+    lrn = learner_main.Learner()
+    runs = []
+    real = lrn.retrain
+    lrn.retrain = lambda recs: runs.append(1) or real(recs)
+    now = 1793000000
+    lrn.tick(now=now)
+    assert len(runs) == 1
+    (tmp_path / "room_labels.jsonl").write_text(json.dumps(
+        {"start": h[0]["start"], "room": "master", "why": "toilet plug", "by": "sensors", "at": "2026-10-26T00:00:00+00:00"}) + "\n")
+    lrn.tick(now=now + learner_main.DEBOUNCE_S + 60)
+    lrn.tick(now=now + 2 * learner_main.DEBOUNCE_S + 120)
+    assert len(runs) == 1
+
+
+@pytest.mark.requirement("water_log_learner: a room failure after labels were found writes nothing at all (labels and rooms are worked out before either is written)")
+def test_room_failure_writes_no_labels_either(tmp_path, monkeypatch):
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    h = history()
+    _write_month(tmp_path, h)
+    calls = []
+    _sensor_stub(monkeypatch, calls)
+    monkeypatch.setattr(learner_main.sensors, "label_all", lambda uses, ev: {h[-1]["start"]: ("washer", "washer cycle")})
+
+    def boom(uses, ev):
+        raise ValueError("gallons")
+    monkeypatch.setattr(learner_main.sensors, "room_all", boom)
+    lrn = learner_main.Learner()
+    lrn.tick(now=1793000000)
+    assert not (tmp_path / "sensor_labels.jsonl").exists() and not (tmp_path / "room_labels.jsonl").exists()
+
+
+@pytest.mark.requirement("water_log_learner: evidence whose room series did not answer writes labels but no rooms (no withdrawals from missing data)")
+def test_rooms_skipped_when_room_evidence_missing(tmp_path, monkeypatch):
+    from learner import sensors
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    h = history()
+    _write_month(tmp_path, h)
+    flush = h[0]
+    t = sensors.epoch(flush["start"])
+    ev = sensors.Evidence(washer=[], dishwasher=[], master=[], upstairs=[], toilet=[(t - 60, 480.0)],
+                          master_near=([], []), upstairs_near=([], []))
+    monkeypatch.setattr(learner_main, "VM_URL", "http://vm.test:8428")
+    monkeypatch.setattr(learner_main, "EVIDENCE", lambda url, a, b: ev._replace(rooms_ok=False))
+    (tmp_path / "room_labels.jsonl").write_text(json.dumps(
+        {"start": h[3]["start"], "room": "upstairs", "why": "x", "by": "sensors", "at": "2026-10-26T00:00:00+00:00"}) + "\n")
+    learner_main.Learner().tick(now=1793000000)
+    assert len((tmp_path / "room_labels.jsonl").read_text().splitlines()) == 1        # nothing withdrawn, nothing added
+
+
+@pytest.mark.requirement("water_log_learner: end to end, the real room_all places a flush with a plug burst and writes it")
+def test_rooms_end_to_end(tmp_path, monkeypatch):
+    from learner import sensors
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    h = history()
+    _write_month(tmp_path, h)
+    flush = h[0]
+    t = sensors.epoch(flush["start"])
+    ev = sensors.Evidence(washer=[], dishwasher=[], master=[], upstairs=[], toilet=[(t - 60, 480.0), (t + 30, 13.0)],
+                          master_near=([], []), upstairs_near=([], []))
+    monkeypatch.setattr(learner_main, "VM_URL", "http://vm.test:8428")
+    monkeypatch.setattr(learner_main, "EVIDENCE", lambda url, a, b: ev)
+    learner_main.Learner().tick(now=1793000000)
+    lines = [json.loads(x) for x in (tmp_path / "room_labels.jsonl").read_text().splitlines()]
+    assert [(x["start"], x["room"], x["why"]) for x in lines] == [(flush["start"], "master", "toilet plug")]
