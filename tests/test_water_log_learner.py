@@ -751,3 +751,27 @@ def test_rooms_end_to_end(tmp_path, monkeypatch):
     learner_main.Learner().tick(now=1793000000)
     lines = [json.loads(x) for x in (tmp_path / "room_labels.jsonl").read_text().splitlines()]
     assert [(x["start"], x["room"], x["why"]) for x in lines] == [(flush["start"], "master", "toilet plug")]
+
+
+@pytest.mark.requirement("water_log_learner: sink series that did not answer leave faucet rooms as they are (no withdrawals), while flush rooms still update; the log names the series")
+def test_faucet_rooms_kept_when_sinks_missing(tmp_path, monkeypatch, capsys):
+    from learner import sensors
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    h = history()
+    _write_month(tmp_path, h)
+    flush = next(u for u in h if u["label"] == "flush")
+    tap = next(u for u in h if u["label"] == "faucet")
+    t = sensors.epoch(flush["start"])
+    ev = sensors.Evidence(washer=[], dishwasher=[], master=[], upstairs=[], toilet=[(t - 60, 480.0)],
+                          master_near=([], []), upstairs_near=([], []), sinks_ok=False, empty=("kitchen_camera",))
+    monkeypatch.setattr(learner_main, "VM_URL", "http://vm.test:8428")
+    monkeypatch.setattr(learner_main, "EVIDENCE", lambda url, a, b: ev)
+    (tmp_path / "room_labels.jsonl").write_text(json.dumps(
+        {"start": tap["start"], "room": "kitchen", "why": "kitchen motion", "by": "sensors",
+         "at": "2026-10-26T00:00:00+00:00"}) + "\n")
+    learner_main.Learner().tick(now=1793000000)
+    latest = learner_main.core.latest([json.loads(x) for x in (tmp_path / "room_labels.jsonl").read_text().splitlines()],
+                                      "at", key="room")
+    assert latest[tap["start"]] == "kitchen"          # kept, not withdrawn
+    assert latest[flush["start"]] == "master"         # bathrooms still placed
+    assert "kitchen_camera" in capsys.readouterr().out

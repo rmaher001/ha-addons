@@ -17,7 +17,9 @@ Evidence, all kept in VictoriaMetrics since 2026-03-16:
 Rooms (plan section "Room column"): which bathroom a shower, bath or flush was
 in, written apart from the labels and never trained on. A flush is placed by a
 plug on the master toilet's seat, whose heater bursts several hundred watts
-around a flush, and by each bathroom's motion and presence sensors.
+around a flush, and by each bathroom's motion and presence sensors. A faucet
+is placed at the one sink - master vanity, upstairs vanity or kitchen - where
+someone is when the water starts.
 """
 import bisect
 import json
@@ -28,10 +30,19 @@ from datetime import datetime
 
 # master/upstairs: shower motion. toilet: the master toilet plug's watts.
 # master_near/upstairs_near: every other motion or presence series per bathroom.
-# rooms_ok False: a room series did not answer over a long read; place nothing.
-Evidence = namedtuple("Evidence", "washer dishwasher master upstairs toilet master_near upstairs_near rooms_ok",
-                      defaults=((), (), (), True))
-ROOM_SERIES = ("toilet", "master_toilet", "master_presence", "upstairs_motion", "upstairs_presence")
+# sinks: ((room, (series, ...)), ...) - who is at each sink.
+# Over a long read, a series with no points at all did not answer: rooms_ok
+# False (a bathroom series) places no rooms; sinks_ok False (a sink series)
+# places no faucet rooms. `empty` names them.
+Evidence = namedtuple("Evidence", "washer dishwasher master upstairs toilet master_near upstairs_near sinks "
+                      "rooms_ok sinks_ok empty", defaults=((), (), (), (), True, True, ()))
+SINKS = (("master", ("master_vanity_presence", "master_vanity_motion")),
+         ("upstairs", ("upstairs_vanity_presence", "upstairs_vanity_motion")),
+         ("kitchen", ("kitchen_motion", "kitchen_camera")))
+BATHROOM_SERIES = ("toilet", "master_toilet", "master_presence", "upstairs_motion", "upstairs_presence")
+SINK_SERIES = tuple(k for _room, keys in SINKS for k in keys)
+ROOM_SERIES = BATHROOM_SERIES + SINK_SERIES
+SINK_WHY = {"master": "master vanity motion", "upstairs": "upstairs vanity motion", "kitchen": "kitchen motion"}
 
 SERIES = {
     "washer": '{__name__="units_state",entity_id="top_load_washer_current_status"}',
@@ -43,6 +54,12 @@ SERIES = {
     "master_presence": '{__name__="units_value",entity_id="master_bathroom_presence_filtered"}',
     "upstairs_motion": '{__name__="units_value",entity_id="upstairs_bathroom_motion_motion"}',
     "upstairs_presence": '{__name__="units_value",entity_id="upstairs_bathroom_presence_filtered"}',
+    "master_vanity_presence": '{__name__="units_value",entity_id="master_bedroom_vanity_presence_filtered"}',
+    "master_vanity_motion": '{__name__="units_value",entity_id="master_bedroom_vanity_motion_occupancy"}',
+    "upstairs_vanity_presence": '{__name__="units_value",entity_id="upstairs_vanity_presence_filtered"}',
+    "upstairs_vanity_motion": '{__name__="units_value",entity_id="upstairs_vanity_motion_motion"}',
+    "kitchen_motion": '{__name__="units_value",entity_id="hue_motion_01_motion"}',
+    "kitchen_camera": '{__name__="units_value",entity_id="kitchen_kitchen_camera_smart_occupancy_sensor_occupancy"}',
 }
 
 MARGIN_S = 6 * 3600
@@ -76,6 +93,10 @@ BATH_MIN_GAL, BATH_MIN_S = 40.0, 15 * 60
 # counts from 5 min before to 1 min after the water starts.
 TOILET_W, TOILET_BEFORE_S, TOILET_AFTER_S = 50.0, 240, 60
 NEAR_BEFORE_S, NEAR_AFTER_S = 300, 60
+# Faucets: someone at the sink from 1 min before to 15 s after the water starts.
+# The kitchen's sensors are on far more often than the vanities', so two sinks
+# at once is common and gives no room.
+SINK_BEFORE_S, SINK_AFTER_S = 60, 15
 
 
 def epoch(iso):
@@ -180,16 +201,23 @@ def label_all(uses, ev):
 
 
 def sensor_room(u, ev):
-    """(room, why) - "master" or "upstairs" - for a sensor-confirmed shower or
-    bath, or a flush; None when no bathroom, or both, fit."""
+    """(room, why) - "master", "upstairs" or (faucets only) "kitchen" - for a
+    sensor-confirmed shower or bath, a flush or a faucet; None when no room,
+    or more than one, fits."""
     if float(u["gallons"]) < MIN_GALLONS or u.get("label") == "tiny":
         return None
     got = sensor_label(u, ev)
     if got and got[0] in ("shower", "bath"):
         return (_shower_rooms(u, ev)[0], got[1])
-    if got or u.get("label") != "flush":      # an appliance fill is in no bathroom
+    if got:                                    # an appliance fill is in no bathroom
         return None
     t = epoch(u["start"])
+    if u.get("label") == "faucet":
+        here = [room for room, series in ev.sinks
+                if any(_active(p, t - SINK_BEFORE_S, t + SINK_AFTER_S) for p in series)]
+        return (here[0], SINK_WHY[here[0]]) if len(here) == 1 else None
+    if u.get("label") != "flush":
+        return None
     a, b = t - NEAR_BEFORE_S, t + NEAR_AFTER_S
     plug = _active(ev.toilet, t - TOILET_BEFORE_S, t + TOILET_AFTER_S, above=TOILET_W, stale=TOILET_BEFORE_S)
     master = plug or any(_active(p, a, b) for p in ev.master_near)
@@ -267,13 +295,16 @@ def evidence(vm_url, start, end):
     # "nothing happened" would withdraw every label of that kind.
     # Room series never fail the read (labels must still flow): an empty one
     # over a long read only stops rooms being placed or withdrawn.
-    rooms_ok = True
+    empty = ()
     if b - a > LONG_READ_S:
-        empty = [k for k, pts in got.items() if not pts and k not in ROOM_SERIES]
-        if empty:
-            raise RuntimeError(f"no points for {', '.join(empty)} over {int((b - a) / 86400)} days")
-        rooms_ok = all(got[k] for k in ROOM_SERIES)
+        missing = [k for k, pts in got.items() if not pts and k not in ROOM_SERIES]
+        if missing:
+            raise RuntimeError(f"no points for {', '.join(missing)} over {int((b - a) / 86400)} days")
+        empty = tuple(k for k in ROOM_SERIES if not got[k])
     return Evidence(washer=cycles([t for t, _v in got["washer"]]), dishwasher=runs(got["dishwasher"]),
                     master=got["master"], upstairs=got["upstairs"], toilet=got["toilet"],
                     master_near=(got["master_toilet"], got["master_presence"]),
-                    upstairs_near=(got["upstairs_motion"], got["upstairs_presence"]), rooms_ok=rooms_ok)
+                    upstairs_near=(got["upstairs_motion"], got["upstairs_presence"]),
+                    sinks=tuple((room, tuple(got[k] for k in keys)) for room, keys in SINKS),
+                    rooms_ok=not set(empty) & set(BATHROOM_SERIES), sinks_ok=not set(empty) & set(SINK_SERIES),
+                    empty=empty)

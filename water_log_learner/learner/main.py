@@ -158,10 +158,16 @@ class Learner:
             # Both worked out before either is written.
             lines = sensors.changed_lines(starts, sensors.label_all(rows, ev), self.sensor_labels(), at)
             rooms = []
-            if getattr(ev, "rooms_ok", True):
-                rooms = sensors.changed_lines(starts, sensors.room_all(rows, ev), self.room_labels(), at, key="room")
+            empty = ", ".join(getattr(ev, "empty", ()))
+            if not getattr(ev, "rooms_ok", True):
+                print(f"{at} rooms skipped: no points for {empty} over the full read", flush=True)
             else:
-                print(f"{at} rooms skipped: a room series returned nothing over the full read", flush=True)
+                placed = starts
+                if not getattr(ev, "sinks_ok", True):
+                    # Faucet rooms stay as they are: missing data is never "nobody at the sink".
+                    print(f"{at} faucet rooms skipped: no points for {empty} over the full read", flush=True)
+                    placed = [u["start"] for u in rows if u.get("label") != "faucet"]
+                rooms = sensors.changed_lines(placed, sensors.room_all(rows, ev), self.room_labels(), at, key="room")
             append_lines(os.path.join(LOG_DIR, "sensor_labels.jsonl"), lines)
             append_lines(os.path.join(LOG_DIR, "room_labels.jsonl"), rooms)
         except Exception as err:

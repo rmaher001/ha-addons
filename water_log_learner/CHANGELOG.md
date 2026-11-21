@@ -1,3 +1,7 @@
+## 0.4.0
+
+- Faucet rooms (rmaher001/ha-automations#712): a faucet is placed at the master vanity, upstairs vanity or kitchen when someone is at exactly one of those sinks as the water starts.
+
 ## 0.3.0
 
 - Rooms (rmaher001/ha-automations#712): showers, baths and flushes placed in the master or upstairs bathroom from the master toilet's plug and each bathroom's motion and presence, written to `room_labels.jsonl`. Never trained on.
