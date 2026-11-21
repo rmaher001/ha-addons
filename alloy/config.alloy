@@ -128,11 +128,12 @@ loki.process "normalize" {
   }
 }
 
-// The estate's log store. The WAL keeps entries on disk across a store
-// restart or a network blip.
+// The estate's log collector, which strips secrets (tokens, passwords, API
+// keys) from every line before the log store keeps it. The WAL keeps entries
+// on disk across a collector restart or a network blip.
 loki.write "victorialogs" {
   endpoint {
-    url = "http://192.168.20.222:9428/insert/loki/api/v1/push"
+    url = "http://192.168.20.222:3500/loki/api/v1/push"
   }
   wal {
     enabled         = true
