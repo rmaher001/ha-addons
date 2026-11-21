@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.4
+
+- Lines go to the estate's log collector, which strips secrets before the
+  log store keeps them (Home Assistant core can print a token into its log).
+
 ## 1.0.3
 
 - The colour-code strip works: `stage.replace` replaces what its capture

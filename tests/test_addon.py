@@ -8,7 +8,7 @@ import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 ADDON = ROOT / "alloy"
-STORE = "http://192.168.20.222:9428/insert/loki/api/v1/push"
+STORE = "http://192.168.20.222:3500/loki/api/v1/push"  # the redacting collector
 
 
 def read(name):
