@@ -265,10 +265,18 @@ def test_empty_room_series_skips_rooms(monkeypatch):
     for missing in ("toilet_plug", "toilet_motion", "master_bathroom_presence", "upstairs_bathroom_motion_motion",
                     "upstairs_bathroom_presence"):
         monkeypatch.setattr(sensors, "fetch", lambda url, match, a, b, m=missing: [] if m in match else [(1.0, 1.0)])
-        assert sensors.evidence("http://vm.test", 0, 30 * 86400).rooms_ok is False
+        ev = sensors.evidence("http://vm.test", 0, 30 * 86400)
+        assert ev.rooms_ok is False and ev.sinks_ok is True and len(ev.empty) == 1
         assert sensors.evidence("http://vm.test", 0, 2 * 86400).rooms_ok is True     # a quiet two days is normal
+    for missing in ("master_bedroom_vanity_presence", "master_bedroom_vanity_motion", "upstairs_vanity_presence",
+                    "upstairs_vanity_motion", "hue_motion_01", "kitchen_camera"):
+        monkeypatch.setattr(sensors, "fetch", lambda url, match, a, b, m=missing: [] if m in match else [(1.0, 1.0)])
+        ev = sensors.evidence("http://vm.test", 0, 30 * 86400)
+        assert ev.sinks_ok is False and ev.rooms_ok is True and len(ev.empty) == 1   # a sink never stops the bathrooms
+        assert sensors.evidence("http://vm.test", 0, 2 * 86400).sinks_ok is True
     monkeypatch.setattr(sensors, "fetch", lambda url, match, a, b: [(1.0, 1.0)])
-    assert sensors.evidence("http://vm.test", 0, 30 * 86400).rooms_ok is True
+    ev = sensors.evidence("http://vm.test", 0, 30 * 86400)
+    assert ev.rooms_ok is True and ev.sinks_ok is True and ev.empty == ()
 
 
 # ---- rooms (ha-automations#712, "Room column") ----------------------------------
@@ -406,3 +414,67 @@ def test_evidence_rooms(monkeypatch):
     ev = sensors.evidence("http://vm.test", 100000, 200000)
     assert ev.toilet == [(1.0, 7.0)]
     assert len(ev.master_near) == 2 and len(ev.upstairs_near) == 2
+
+
+# ---- faucet rooms: which sink (master vanity, upstairs vanity, kitchen) -----------
+
+def faucet(t, gal=0.4):
+    u = use(datetime.fromtimestamp(t, tz=timezone.utc).isoformat(), 20, gal, 1.3, 1.5)
+    u["label"] = "faucet"
+    return u
+
+
+def sinks_ev(master=(), upstairs=(), kitchen=()):
+    return sensors.Evidence(washer=[], dishwasher=[], master=[], upstairs=[],
+                            sinks=(("master", ([], list(master))), ("upstairs", (list(upstairs), [])),
+                                   ("kitchen", ([], list(kitchen)))))
+
+
+@pytest.mark.requirement("water_log_sensors: a faucet with someone at exactly one sink (master vanity, upstairs vanity or kitchen) is in that room")
+def test_faucet_rooms():
+    assert sensors.sensor_room(faucet(T0), sinks_ev(kitchen=[(T0 - 30, 1)])) == ("kitchen", "kitchen motion")
+    assert sensors.sensor_room(faucet(T0), sinks_ev(master=[(T0 - 10, 1)])) == ("master", "master vanity motion")
+    assert sensors.sensor_room(faucet(T0), sinks_ev(upstairs=[(T0 + 10, 1)])) == ("upstairs", "upstairs vanity motion")
+
+
+@pytest.mark.requirement("water_log_sensors: someone at two sinks, or at none, gives a faucet no room")
+def test_faucet_room_needs_one_sink():
+    assert sensors.sensor_room(faucet(T0), sinks_ev(master=[(T0 - 10, 1)], kitchen=[(T0 - 10, 1)])) is None
+    assert sensors.sensor_room(faucet(T0), sinks_ev()) is None
+
+
+@pytest.mark.requirement("water_log_sensors: sink motion counts from 1 minute before to 15 s after the water starts")
+def test_faucet_window():
+    assert sensors.sensor_room(faucet(T0), sinks_ev(kitchen=[(T0 - 90, 1), (T0 - 70, 0)])) is None
+    assert sensors.sensor_room(faucet(T0), sinks_ev(kitchen=[(T0 + 30, 1)])) is None
+    assert sensors.sensor_room(faucet(T0), sinks_ev(kitchen=[(T0 - 55, 1), (T0 - 50, 0)])) == ("kitchen", "kitchen motion")
+    # the edges themselves: 60 s before, 15 s after
+    assert sensors.sensor_room(faucet(T0), sinks_ev(kitchen=[(T0 - 59, 1), (T0 - 58, 0)])) == ("kitchen", "kitchen motion")
+    assert sensors.sensor_room(faucet(T0), sinks_ev(kitchen=[(T0 - 62, 1), (T0 - 61, 0)])) is None
+    assert sensors.sensor_room(faucet(T0), sinks_ev(kitchen=[(T0 + 14, 1)])) == ("kitchen", "kitchen motion")
+    assert sensors.sensor_room(faucet(T0), sinks_ev(kitchen=[(T0 + 16, 1)])) is None
+
+
+@pytest.mark.requirement("water_log_sensors: a sink sensor still on from up to 30 minutes before counts; older is a stuck sensor")
+def test_sink_carry_over():
+    assert sensors.sensor_room(faucet(T0), sinks_ev(master=[(T0 - 25 * 60, 1)])) == ("master", "master vanity motion")
+    assert sensors.sensor_room(faucet(T0), sinks_ev(master=[(T0 - 35 * 60, 1)])) is None
+
+
+@pytest.mark.requirement("water_log_sensors: a faucet-shaped use the sensors call dishwasher gets no room; flushes are not placed by sink sensors")
+def test_sinks_place_only_faucets():
+    slow = use("2026-06-03T08:09:37+00:00", 85, 1.09, 0.75, 0.78)
+    slow["label"] = "faucet"
+    t = ts(slow["start"])
+    ev = evidence()._replace(sinks=(("kitchen", ([(t - 30, 1)],)),))
+    assert sensors.sensor_label(slow, ev)[0] == "dishwasher"
+    assert sensors.sensor_room(slow, ev) is None
+    assert sensors.sensor_room(flush(T0), sinks_ev(kitchen=[(T0 - 30, 1)])) is None
+
+
+@pytest.mark.requirement("water_log_sensors: evidence carries each sink's motion and presence series")
+def test_evidence_sinks(monkeypatch):
+    monkeypatch.setattr(sensors, "fetch", lambda url, match, a, b: [(1.0, 1.0)])
+    ev = sensors.evidence("http://vm.test", 100000, 200000)
+    assert [room for room, _series in ev.sinks] == ["master", "upstairs", "kitchen"]
+    assert all(len(series) == 2 for _room, series in ev.sinks)
