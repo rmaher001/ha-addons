@@ -775,3 +775,29 @@ def test_faucet_rooms_kept_when_sinks_missing(tmp_path, monkeypatch, capsys):
     assert latest[tap["start"]] == "kitchen"          # kept, not withdrawn
     assert latest[flush["start"]] == "master"         # bathrooms still placed
     assert "kitchen_camera" in capsys.readouterr().out
+
+
+@pytest.mark.requirement("water_log_learner: an unknown use is placed in the one room with anyone in it, but not while the sink series did not answer (the kitchen could not be ruled out)")
+def test_unknown_rooms_need_the_sinks(tmp_path, monkeypatch):
+    from learner import sensors
+    monkeypatch.setattr(learner_main, "LOG_DIR", str(tmp_path))
+    h = history()
+    _write_month(tmp_path, h)
+    odd = next(u for u in h if u["label"] == "unknown")
+    t = sensors.epoch(odd["start"])
+    monkeypatch.setattr(learner_main, "VM_URL", "http://vm.test:8428")
+
+    def placed(sinks_ok):
+        for f in tmp_path.glob("room_labels.jsonl"):
+            f.unlink()
+        ev = sensors.Evidence(washer=[], dishwasher=[], master=[], upstairs=[], toilet=[],
+                              master_near=([], [(t - 60, 1), (t + 120, 0)]), upstairs_near=([], []),
+                              sinks_ok=sinks_ok, empty=() if sinks_ok else ("kitchen_camera",))
+        monkeypatch.setattr(learner_main, "EVIDENCE", lambda url, a, b: ev)
+        learner_main.Learner().tick(now=1793000000)
+        path = tmp_path / "room_labels.jsonl"
+        lines = [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
+        return {x["start"]: x["room"] for x in lines}
+
+    assert placed(True).get(odd["start"]) == "master"
+    assert odd["start"] not in placed(False)

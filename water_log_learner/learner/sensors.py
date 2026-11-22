@@ -19,7 +19,8 @@ in, written apart from the labels and never trained on. A flush is placed by a
 plug on the master toilet's seat, whose heater bursts several hundred watts
 around a flush, and by each bathroom's motion and presence sensors. A faucet
 is placed at the one sink - master vanity, upstairs vanity or kitchen - where
-someone is when the water starts.
+someone is when the water starts. A use the rules call unknown is placed in
+the one room - kitchen, master or upstairs bathroom - anyone is in then.
 """
 import bisect
 import json
@@ -162,6 +163,16 @@ def _shower_rooms(u, ev):
             if _active(getattr(ev, room), t - MOTION_BEFORE_S, t + MOTION_AFTER_S)]
 
 
+def _appliances(u, ev):
+    """(washer fits, dishwasher fits) for a use, by the appliance's run and the fill's speed."""
+    gal, dur, med = float(u["gallons"]), float(u["duration_s"]), float(u["median_gpm"])
+    t = epoch(u["start"])
+    washer = _inside(t, ev.washer) and gal >= WASHER_MIN_GAL and med >= WASHER_MIN_GPM
+    dish = (_inside(t, ev.dishwasher) and med <= DISH_MAX_GPM and dur <= DISH_MAX_S
+            and float(u["peak_gpm"]) <= DISH_MAX_PEAK)
+    return washer, dish
+
+
 def sensor_label(u, ev):
     """(label, why) when the sensors confirm one explanation, else None."""
     gal, dur, med = float(u["gallons"]), float(u["duration_s"]), float(u["median_gpm"])
@@ -171,9 +182,7 @@ def sensor_label(u, ev):
     rooms = _shower_rooms(u, ev)
     if len(rooms) > 1:
         return None
-    washer = _inside(t, ev.washer) and gal >= WASHER_MIN_GAL and med >= WASHER_MIN_GPM
-    dish = (_inside(t, ev.dishwasher) and med <= DISH_MAX_GPM and dur <= DISH_MAX_S
-            and float(u["peak_gpm"]) <= DISH_MAX_PEAK)
+    washer, dish = _appliances(u, ev)
     if dur >= SHOWER_MIN_S and gal >= SHOWER_MIN_GAL and rooms:
         if washer or dish:
             return None                        # an appliance fits too: two explanations
@@ -201,9 +210,9 @@ def label_all(uses, ev):
 
 
 def sensor_room(u, ev):
-    """(room, why) - "master", "upstairs" or (faucets only) "kitchen" - for a
-    sensor-confirmed shower or bath, a flush or a faucet; None when no room,
-    or more than one, fits."""
+    """(room, why) - "master", "upstairs" or (faucets and unknowns only)
+    "kitchen" - for a sensor-confirmed shower or bath, a flush, a faucet or an
+    unknown use; None when no room, or more than one, fits."""
     if float(u["gallons"]) < MIN_GALLONS or u.get("label") == "tiny":
         return None
     got = sensor_label(u, ev)
@@ -216,6 +225,9 @@ def sensor_room(u, ev):
         here = [room for room, series in ev.sinks
                 if any(_active(p, t - SINK_BEFORE_S, t + SINK_AFTER_S) for p in series)]
         return (here[0], SINK_WHY[here[0]]) if len(here) == 1 else None
+    if u.get("label") == "unknown":
+        # An appliance fill is in no bathroom, even when only "maybe" one.
+        return None if any(_appliances(u, ev)) else _unknown_room(u, ev)
     if u.get("label") != "flush":
         return None
     a, b = t - NEAR_BEFORE_S, t + NEAR_AFTER_S
@@ -227,6 +239,32 @@ def sensor_room(u, ev):
     if master:
         return ("master", "toilet plug" if plug else "master bathroom motion")
     return ("upstairs", "upstairs bathroom motion")
+
+
+UNKNOWN_WHY = {"master": "only the master bathroom had someone",
+               "upstairs": "only the upstairs bathroom had someone",
+               "kitchen": "only the kitchen had someone"}
+
+
+def _unknown_room(u, ev):
+    """(room, why) for a use the rules could not name: the one room - kitchen,
+    master or upstairs bathroom - where anyone was when the water started.
+    Each sink counts over the sink window; a bathroom's shower motion, other
+    motion and presence (and the master toilet plug) over the bathroom window.
+    Nobody seen, or people in two rooms, is no room (Richard, 2026-11-21)."""
+    t = epoch(u["start"])
+    a, b = t - NEAR_BEFORE_S, t + NEAR_AFTER_S
+    here = {room for room, series in ev.sinks
+            if any(_active(p, t - SINK_BEFORE_S, t + SINK_AFTER_S) for p in series)}
+    if (_active(ev.toilet, t - TOILET_BEFORE_S, t + TOILET_AFTER_S, above=TOILET_W, stale=TOILET_BEFORE_S)
+            or _active(ev.master, a, b) or any(_active(p, a, b) for p in ev.master_near)):
+        here.add("master")
+    if _active(ev.upstairs, a, b) or any(_active(p, a, b) for p in ev.upstairs_near):
+        here.add("upstairs")
+    if len(here) != 1:
+        return None
+    room = here.pop()
+    return (room, UNKNOWN_WHY[room])
 
 
 def room_all(uses, ev):
