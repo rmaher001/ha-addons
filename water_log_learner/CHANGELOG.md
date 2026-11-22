@@ -1,3 +1,7 @@
+## 0.5.0
+
+- Unknown rooms (rmaher001/ha-automations#712): a use the rules call unknown is placed in the kitchen, master or upstairs bathroom when anyone is in exactly one of those rooms as the water starts. Skipped, like faucet rooms, while a sink series has no points over a long read.
+
 ## 0.4.0
 
 - Faucet rooms (rmaher001/ha-automations#712): a faucet is placed at the master vanity, upstairs vanity or kitchen when someone is at exactly one of those sinks as the water starts.

@@ -383,6 +383,7 @@ def test_other_uses_get_no_room():
     sink["label"] = "faucet"
     assert sensors.sensor_room(sink, rooms_ev(toilet=[(T0 - 60, 480.0)], master=[(T0 - 60, 1)])) is None
     short = use(sink["start"], 60, 2.5, 4.3)                    # in the shower room but too short to be a shower
+    short["label"] = "softener"                                 # a rule label the sensors never place
     assert sensors.sensor_room(short, rooms_ev(upstairs_shower=[(T0 - 30, 1)])) is None
 
 
@@ -478,3 +479,69 @@ def test_evidence_sinks(monkeypatch):
     ev = sensors.evidence("http://vm.test", 100000, 200000)
     assert [room for room, _series in ev.sinks] == ["master", "upstairs", "kitchen"]
     assert all(len(series) == 2 for _room, series in ev.sinks)
+
+
+# ---- unknown uses: the one room someone is in (Richard, 2026-11-21) -----------
+
+def unknown(t, gal=0.11):
+    return use(datetime.fromtimestamp(t, tz=timezone.utc).isoformat(), 5, gal, 1.3, 1.5)
+
+
+def house_ev(toilet=(), master=(), upstairs=(), master_shower=(), upstairs_shower=(),
+             master_sink=(), upstairs_sink=(), kitchen=()):
+    return sensors.Evidence(washer=[], dishwasher=[], master=list(master_shower), upstairs=list(upstairs_shower),
+                            toilet=list(toilet), master_near=(list(master), []), upstairs_near=([], list(upstairs)),
+                            sinks=(("master", ([], list(master_sink))), ("upstairs", (list(upstairs_sink), [])),
+                                   ("kitchen", ([], list(kitchen)))))
+
+
+@pytest.mark.requirement("water_log_sensors: an unknown use with someone in exactly one room (kitchen, master or upstairs) is in that room")
+def test_unknown_rooms():
+    assert sensors.sensor_room(unknown(T0), house_ev(kitchen=[(T0 - 30, 1)])) == ("kitchen", "only the kitchen had someone")
+    assert sensors.sensor_room(unknown(T0), house_ev(master_sink=[(T0 - 10, 1)])) == ("master", "only the master bathroom had someone")
+    assert sensors.sensor_room(unknown(T0), house_ev(master=[(T0 - 200, 1)])) == ("master", "only the master bathroom had someone")
+    assert sensors.sensor_room(unknown(T0), house_ev(toilet=[(T0 - 60, 480.0)])) == ("master", "only the master bathroom had someone")
+    assert sensors.sensor_room(unknown(T0), house_ev(upstairs_shower=[(T0 - 30, 1)])) == ("upstairs", "only the upstairs bathroom had someone")
+    assert sensors.sensor_room(unknown(T0), house_ev(upstairs_sink=[(T0 + 10, 1)])) == ("upstairs", "only the upstairs bathroom had someone")
+    assert sensors.sensor_room(unknown(T0), house_ev(upstairs=[(T0 - 250, 1), (T0 - 200, 0)])) == ("upstairs", "only the upstairs bathroom had someone")
+
+
+@pytest.mark.requirement("water_log_sensors: an unknown use with nobody seen, or someone in two rooms, gets no room")
+def test_unknown_room_needs_one_room():
+    assert sensors.sensor_room(unknown(T0), house_ev()) is None
+    assert sensors.sensor_room(unknown(T0), house_ev(kitchen=[(T0 - 30, 1)], master=[(T0 - 30, 1)])) is None
+    assert sensors.sensor_room(unknown(T0), house_ev(upstairs_sink=[(T0, 1)], master_shower=[(T0, 1)])) is None
+    assert sensors.sensor_room(unknown(T0, 0.05), house_ev(kitchen=[(T0 - 30, 1)])) is None   # tiny: never
+    assert sensors.sensor_room(unknown(T0), house_ev(toilet=[(T0 - 60, 30.0)])) is None       # seat warmer idle
+    assert sensors.sensor_room(unknown(T0), house_ev(toilet=[(T0 - 400, 480.0), (T0 - 350, 13.0)])) is None
+
+
+@pytest.mark.requirement("water_log_sensors: unknown rooms use the sink window at sinks and the bathroom window in bathrooms")
+def test_unknown_room_windows():
+    # a sink counts from 1 min before to 15 s after; the kitchen has only sink sensors
+    assert sensors.sensor_room(unknown(T0), house_ev(kitchen=[(T0 - 90, 1), (T0 - 70, 0)])) is None
+    assert sensors.sensor_room(unknown(T0), house_ev(kitchen=[(T0 + 30, 1)])) is None
+    # bathroom motion or presence counts from 5 min before to 1 min after
+    assert sensors.sensor_room(unknown(T0), house_ev(upstairs=[(T0 - 400, 1), (T0 - 320, 0)])) is None
+    assert sensors.sensor_room(unknown(T0), house_ev(upstairs=[(T0 + 90, 1)])) is None
+
+
+@pytest.mark.requirement("water_log_sensors: an unknown use the sensors label (a washer fill) is placed as that label, not by who is around")
+def test_labelled_unknown_is_not_placed_by_presence():
+    ev = house_ev(kitchen=[(T0 - 30, 1)])
+    ev = ev._replace(washer=[(T0 - 600, T0 + 600)])
+    fill = use(datetime.fromtimestamp(T0, tz=timezone.utc).isoformat(), 120, 8.0, 4.5)
+    assert sensors.sensor_label(fill, ev) == ("washer", "washer cycle")
+    assert sensors.sensor_room(fill, ev) is None
+
+
+@pytest.mark.requirement("water_log_sensors: an unknown use a washer or dishwasher run could also explain gets no room from who is around")
+def test_unknown_room_not_given_when_an_appliance_fits():
+    long_fill = use(datetime.fromtimestamp(T0, tz=timezone.utc).isoformat(), 240, 9.0, 4.5)
+    ev = house_ev(upstairs_shower=[(T0 - 30, 1)])._replace(washer=[(T0 - 600, T0 + 600)])
+    assert sensors.sensor_label(long_fill, ev) is None                 # two explanations: no label
+    assert sensors.sensor_room(long_fill, ev) is None
+    slow = use(long_fill["start"], 120, 1.4, 0.7, 0.9)
+    ev = house_ev(kitchen=[(T0 - 30, 1)])._replace(dishwasher=[(T0 - 600, T0 + 600)], washer=[(T0 - 600, T0 + 600)])
+    assert sensors.sensor_label(slow, ev) is None                      # slow fill in a wash cycle: either appliance
+    assert sensors.sensor_room(slow, ev) is None

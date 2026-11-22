@@ -164,9 +164,10 @@ class Learner:
             else:
                 placed = starts
                 if not getattr(ev, "sinks_ok", True):
-                    # Faucet rooms stay as they are: missing data is never "nobody at the sink".
-                    print(f"{at} faucet rooms skipped: no points for {empty} over the full read", flush=True)
-                    placed = [u["start"] for u in rows if u.get("label") != "faucet"]
+                    # Faucet and unknown rooms stay as they are: missing data is never
+                    # "nobody at the sink" (an unknown's room needs the kitchen ruled out).
+                    print(f"{at} faucet and unknown rooms skipped: no points for {empty} over the full read", flush=True)
+                    placed = [u["start"] for u in rows if u.get("label") not in ("faucet", "unknown")]
                 rooms = sensors.changed_lines(placed, sensors.room_all(rows, ev), self.room_labels(), at, key="room")
             append_lines(os.path.join(LOG_DIR, "sensor_labels.jsonl"), lines)
             append_lines(os.path.join(LOG_DIR, "room_labels.jsonl"), rooms)

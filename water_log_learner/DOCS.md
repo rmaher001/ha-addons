@@ -13,7 +13,9 @@ from VictoriaMetrics: all history on start and nightly, the last 48 hours every
 card with a ring, and taught to the model (Richard's labels still win). The
 same pass places showers, baths and flushes in the master or upstairs bathroom
 (a toilet seat's plug and each bathroom's motion and presence), and faucets at
-the master vanity, upstairs vanity or kitchen sink (who is at which sink), in
+the master vanity, upstairs vanity or kitchen sink (who is at which sink). A
+use the rules call unknown goes in the one room - kitchen, master or upstairs
+bathroom - where anyone is when it starts. Rooms are written to
 `room_labels.jsonl`, the card's room column; rooms are never trained on.
 
 Reads `/config/water_log/*.jsonl`, `labels.jsonl` and VictoriaMetrics. Writes
